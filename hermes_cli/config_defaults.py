@@ -1897,6 +1897,13 @@ DEFAULT_CONFIG = {
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,
+        # Forward the user's SSH agent socket (SSH_AUTH_SOCK) to workers spawned for
+        # this profile. The gateway runs under launchd/systemd WITHOUT SSH_AUTH_SOCK, so
+        # enable this ONLY on specialist profiles whose workers genuinely reach
+        # GitHub/SSH hosts; the dispatcher then discovers the launchd agent socket
+        # (launchctl getenv SSH_AUTH_SOCK on macOS) and forwards the pointer — never key
+        # material — to those workers. Off by default.
+        "forward_ssh_agent": False,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,

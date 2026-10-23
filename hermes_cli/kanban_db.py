@@ -3285,7 +3285,11 @@ def request_review(
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
 ):
-    """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
+    """``running``/``ready`` -> ``review``; clears the stale failure error on handoff.
+
+    The stale ``last_failure_error`` snapshot is cleared (atomically with the
+    transition) so a since-resolved quota/auth wall cannot gate the reviewer's
+    spawn; the ``consecutive_failures`` breaker budget is preserved.
 
     Implementer and reviewer are recorded on the event so requested changes
     route back to the right profile; ``reviewer`` reassigns the task, and on
@@ -3402,6 +3406,13 @@ def request_review(
             if staged:
                 payload["artifacts"] = staged
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
+            # The implementer's run just succeeded (review_requested): any prior
+            # transient failure — e.g. a since-resolved quota wall — is obsolete
+            # as a blocker signal and must not gate the REVIEWER's spawn.
+            # Clear only that stale error snapshot (inside THIS transaction, so
+            # the transition and the clear are atomic); the consecutive-failures
+            # breaker budget is preserved — complete_task is the terminal wipe.
+            _clear_stale_failure_error(conn, task_id)
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
@@ -4440,6 +4451,7 @@ from hermes_cli.kanban_db_dispatch import (
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
     _clear_failure_counter,
+    _clear_stale_failure_error,
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,

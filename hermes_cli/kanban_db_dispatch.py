@@ -1523,6 +1523,31 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _clear_stale_failure_error(conn: sqlite3.Connection, task_id: str) -> None:
+    """Clear ONLY the stale ``last_failure_error`` snapshot, preserving the
+    breaker counter.
+
+    Used on a successful review handoff, which is NOT terminal (unlike
+    ``complete_task``): the reviewer will still run, and a task bouncing
+    through ``changes_requested`` must not get its consecutive-failures budget
+    reset every cycle — that would weaken the circuit breaker. The
+    implementer's just-finished run *succeeded*, so the prior error text (e.g.
+    a since-resolved quota wall that would otherwise match the respawn blocker
+    and gate the REVIEWER's spawn) is obsolete as a blocker signal. The durable
+    diagnosis lives on in ``task_runs``/``task_events``; only the denormalized
+    snapshot on the row is cleared.
+
+    Opens no transaction of its own: the caller MUST hold an open write
+    transaction so the clear commits atomically with the ``running→review``
+    transition. A reader (the dispatcher) must never observe ``review`` status
+    alongside a stale blocker error.
+    """
+    conn.execute(
+        "UPDATE tasks SET last_failure_error = NULL WHERE id = ?",
+        (task_id,),
+    )
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -2825,6 +2850,59 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
+def _discover_ssh_auth_sock(
+    environ: Optional[Mapping[str, str]] = None,
+    *,
+    _run: Optional[Callable[..., Any]] = None,
+) -> Optional[str]:
+    """Resolve the user's SSH agent socket WITHOUT touching credentials.
+
+    Hermes' gateway daemon is launchd/systemd-started, so ``SSH_AUTH_SOCK`` is
+    absent from its environment even though the user's ssh-agent holds the
+    already-unlocked keys. On macOS the launchd-managed agent advertises its
+    socket via ``launchctl getenv SSH_AUTH_SOCK``; read that when the process
+    env does not already carry it. Returns the socket path, or ``None`` when
+    nothing can be resolved. Never reads or copies key material — only the
+    pointer to the agent the user has already unlocked.
+    """
+    environ = os.environ if environ is None else environ
+    sock = (environ.get("SSH_AUTH_SOCK") or "").strip()
+    if sock:
+        return sock
+    if sys.platform != "darwin":
+        return None
+    run = _run or subprocess.run
+    try:
+        proc = run(
+            ["launchctl", "getenv", "SSH_AUTH_SOCK"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (proc.stdout or "").strip() or None
+
+
+def _maybe_forward_ssh_agent(env: dict[str, str], profile_home: Optional[str]) -> None:
+    """Forward the SSH agent socket pointer into *env* for a profile that opts in.
+
+    Reads ``kanban.forward_ssh_agent`` from the assignee profile's config (via a
+    home-bound profile scope) and, when enabled, discovers + injects
+    ``SSH_AUTH_SOCK``. Fail-closed: a missing config or an unresolvable socket
+    simply means no forwarding — a worker is never blocked by SSH discovery.
+    """
+    if not profile_home:
+        return
+    with _worker_profile_scope(profile_home, bind_home=True):
+        from hermes_cli.config import cfg_get, load_config_readonly
+        forward_ssh = bool(cfg_get(
+            load_config_readonly(), "kanban", "forward_ssh_agent", default=False,
+        ))
+    if forward_ssh:
+        sock = _discover_ssh_auth_sock()
+        if sock:
+            env["SSH_AUTH_SOCK"] = sock
+
+
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -2933,6 +3011,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # `--cli` is the highest-precedence TUI override; dropping HERMES_TUI covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
+
+    # Opt-in SSH-agent forwarding: forward the agent socket pointer to this
+    # worker only when ITS profile sets kanban.forward_ssh_agent — a per-profile
+    # guard so a GitHub/SSH-needing specialist gets the agent while unrelated
+    # workers never see it. The gateway runs without SSH_AUTH_SOCK (launchd /
+    # systemd), so discover it via `launchctl getenv`, not the parent env.
+    # Forwarding the pointer (never key material) leaves credentials unchanged.
+    _maybe_forward_ssh_agent(env, profile_home)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # The module argv must carry the import context that made it resolvable:
