@@ -21,12 +21,14 @@ from zoneinfo import ZoneInfo
 
 from hermes_constants import get_hermes_home
 
-VERSION = "2026-10-30-v3-baseline-provenance"
+VERSION = "2026-10-30-v4-unattended-only"
 
+# Legacy recovery readers remain only so historical recovery records can be
+# inspected by older tooling. No enforcement or CLI path can activate them.
 RECOVERY_FILE = "cache/interactive-recovery.json"
 RECOVERY_ALLOWANCE_USD = 2.0
 RECOVERY_ZONE = ZoneInfo("America/Toronto")
-RECOVERY_SCOPE = "one explicitly initiated interactive Hermes Desktop conversation"
+RECOVERY_SCOPE = "retired interactive recovery mechanism"
 
 
 class SpendGuardBlocked(RuntimeError):
@@ -180,18 +182,15 @@ def _has_unattended_marker(cron=""):
 
 
 def _current_interactive_identity():
-    """Server-derived identity for the exact attended Desktop turn, or None.
-
-    Source is necessary but never sufficient: the process must be the live
-    Desktop backend itself, both server-generated session identifiers must be
-    present, and every known unattended/delegated marker must be absent.
-    """
+    """Server-attested identity for the exact attended Desktop turn, or None."""
     source, session_id, ui_session_id, cron = _session_identity_fields()
-    if (source != "desktop" or not session_id or not ui_session_id
-            or _has_unattended_marker(cron) or not _is_desktop_backend_process()):
+    from agent.interactive_spending import is_attended_desktop_provider_request
+
+    if (source != "desktop" or not session_id or not ui_session_id or cron
+            or not is_attended_desktop_provider_request()):
         return None
     return {"source": source, "session_id": session_id, "ui_session_id": ui_session_id,
-            "pid": os.getpid(), "ppid": os.getppid()}
+            "pid": os.getpid()}
 
 
 def _operator_desktop_identity():
@@ -208,7 +207,7 @@ def _operator_desktop_identity():
         pid = os.getpid()
         for _ in range(8):
             parent, _ = _process_row(pid)
-            grandparent, parent_command = _process_row(parent)
+            _grandparent, parent_command = _process_row(parent)
             if _is_hermes_desktop_command(parent_command):
                 return {"source": source, "session_id": session_id, "ui_session_id": ui_session_id,
                         "pid": pid, "ppid": parent}
@@ -299,7 +298,7 @@ def _validated_recovery_for_current():
         record = _read_private_json(_recovery_path())
     except FileNotFoundError:
         return None
-    except Exception as exc:
+    except Exception:
         raise SpendGuardBlocked(
             "Paid request stopped: recovery authorization is invalid. No model request sent."
         ) from None
@@ -578,6 +577,11 @@ def enforce(provider=None, base_url=None, **_context):
     kind = route_kind(provider, base_url)
     if kind in {"subscription", "local"}:
         return
+    # Authenticated Desktop turns are isolated onto their own provider-limited
+    # key at the final wire boundary. Local accounting is intentionally not a
+    # dependency for them; unattended work remains fail-closed below.
+    if kind == "openrouter" and _current_interactive_identity() is not None:
+        return
     operation = "settings"
     try:
         _, _, cap = read_settings()
@@ -585,16 +589,6 @@ def enforce(provider=None, base_url=None, **_context):
             _diagnose("route-check", SpendGuardBlocked())
             raise SpendGuardBlocked("Paid request stopped: this route has no verified spending meter. "
                                     "Select OpenRouter, OpenAI Codex subscription, or a local model.")
-        recovery = _recovery_reading_or_none()
-        if recovery is not None:
-            if recovery["used_usd"] >= recovery["authorized_usd"]:
-                _diagnose("recovery-exhausted", SpendGuardBlocked())
-                raise SpendGuardBlocked(
-                    f"Interactive recovery allowance exhausted: ${recovery['used_usd']:.2f} used / "
-                    f"${recovery['authorized_usd']:.2f} authorized. No model request sent; "
-                    "no paid fallback is allowed."
-                )
-            return
         operation = "account-usage"
         spend = live_spend()
         operation = "budget-lock"
@@ -611,21 +605,9 @@ def enforce(provider=None, base_url=None, **_context):
                     raise ValueError("Invalid budget lock")
                 spend = max(spend, locked_spend)
         if spend >= cap:
-            # An attended conversation with Avra keeps going past the cap, up to
-            # the interactive grace; unattended work (workers, cron, delegated
-            # agents) is stopped exactly at the cap, as before.
-            settings, _base, _cap = read_settings()
-            grace = interactive_grace(settings)
-            ceiling = cap + grace
-            attended = _current_interactive_identity()
-            if attended is not None and spend < ceiling:
-                _diagnose("budget-exceeded-interactive", SpendGuardBlocked("interactive-grace"))
-                return
-            over = "" if attended is not None else " (unattended work stops at the cap)"
             _diagnose("budget-exhausted", SpendGuardBlocked())
             raise SpendGuardBlocked(
-                f"OpenRouter daily cap reached: ${spend:.2f} spent / ${cap:.2f} limit{over}. "
-                f"Interactive ceiling is ${ceiling:.2f}. "
+                f"OpenRouter unattended daily cap reached: ${spend:.2f} spent / ${cap:.2f} limit. "
                 "Use hermes-budget status, hermes-budget today AMOUNT, or choose Codex subscription/local.")
     except SpendGuardBlocked:
         raise
@@ -636,26 +618,10 @@ def enforce(provider=None, base_url=None, **_context):
 def main():
     parser = argparse.ArgumentParser(description="View/set the OpenRouter daily cap in USD. No model calls.")
     parser.add_argument("action", nargs="?", default="status",
-                        choices=["status", "set", "today", "clear", "recover", "recovery-status"])
+                        choices=["status", "set", "today", "clear"])
     parser.add_argument("amount", nargs="?", type=amount)
     args = parser.parse_args()
     data, base, cap = _verified("settings", read_settings)
-    if args.action == "recover":
-        if args.amount is not None:
-            parser.error("The recovery allowance is fixed at US$2")
-        record = authorize_recovery()
-        print(f"Interactive recovery authorized: ${record['authorized_usd']:.2f} incremental account-wide usage")
-        print(f"Expires: {record['expires_at']} (America/Toronto); no automatic renewal")
-        print("Scope: this exact live Hermes Desktop conversation only. Unattended work remains restricted.")
-        print(record["notice"])
-        return 0
-    if args.action == "recovery-status":
-        reading = recovery_reading()
-        print(f"Interactive recovery: ${reading['used_usd']:.4f} used; "
-              f"${reading['remaining_usd']:.4f} remaining of ${reading['authorized_usd']:.2f}")
-        print(f"Expires: {reading['expires_at']} (America/Toronto)")
-        print("Incremental allowance only; not proof the original daily cap was respected.")
-        return 0
     if args.action in {"set", "today"} and args.amount is None:
         parser.error("Supply the total daily limit, for example: hermes-budget today 20")
     if args.action == "set":
@@ -671,8 +637,8 @@ def main():
     _, base, cap = _verified("settings", read_settings)
     print(f"OpenRouter base: ${base:.2f}/day; effective today ({today()}): ${cap:.2f}")
     print("Codex subscription and recognized local models bypass this cap. Today-only raises expire at local midnight.")
-    print(f"Interactive grace: ${interactive_grace(data):.2f} over the cap for an attended Desktop conversation; "
-          "unattended work stops at the cap.")
+    print("Attended Desktop OpenRouter requests use the dedicated provider-limited interactive key; "
+          "this local cap applies only to unattended work.")
     if args.action == "status":
         try:
             reading = spend_reading()

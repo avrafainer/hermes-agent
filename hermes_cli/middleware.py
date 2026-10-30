@@ -135,6 +135,11 @@ def apply_tool_request_middleware(
 def run_llm_execution_middleware(
     request: dict[str, Any], next_call: Callable[[dict[str, Any]], Any], **context: Any) -> Any:
     """Run provider execution through registered LLM execution middleware."""
+    from agent.automated_model_authorization import enforce_automated_model_authorization
+    from hermes_cli.local_spend_guard import enforce
+
+    enforce(**context)
+    enforce_automated_model_authorization(**context)
     return _run_execution_chain(
         LLM_EXECUTION_MIDDLEWARE, next_call,
         request=request, original_request=context.pop("original_request", request), **context)

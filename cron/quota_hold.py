@@ -112,41 +112,29 @@ def _recovery_worthwhile(
 def plan_hold(
     job: dict[str, Any], hold_seconds: float, *, recover_consumed_fire: bool = False,
 ) -> bool:
-    """Called under the jobs lock AFTER ``_advance_after_run`` computed the schedule's natural
-    ``next_run_at`` for a failed run. A scheduled sparse cron may retry its consumed fire at the
-    recovery boundary; manual runs keep the natural schedule. Otherwise coalesce fires through
-    the closed window. Returns True when parked."""
-    from cron.jobs import _instant_before, _parse_aware, compute_next_run
+    """Pause recurring work after a provider quota failure.
+
+    A reset boundary is accounting information, not authorization to resume expensive unattended
+    work.  Operators must explicitly resume the job after deciding that its bounded model budget
+    is appropriate.  Returns True when paused.
+    """
 
     schedule = job.get("schedule") or {}
     kind = schedule.get("kind")
     if kind not in {"cron", "interval"} or job.get("state") == "paused":
         clear_state(job)
         return False
-    window_end = _window_end(hold_seconds)
-    natural_next = _parse_aware(job.get("next_run_at"))
-    blocked = natural_next is None or _instant_before(natural_next, window_end)
-    recover = (kind == "cron" and not blocked and recover_consumed_fire
-               and _recovery_worthwhile(job, natural_next, window_end))
-    if not blocked and not recover:
-        clear_state(job)
-        return False
-    if kind == "cron" and blocked:
-        # Coalesce cron occurrences inside the closed window to the first legal instant after it.
-        parked = compute_next_run(schedule, window_end.isoformat()) or window_end.isoformat()
-    else:
-        parked = window_end.isoformat()
-    if recover:
-        # Only the recovery fire is off-lattice; the coalesced instant is a legal occurrence.
-        job[SCHEDULE_EXPR_KEY] = schedule.get("expr")
-    else:
-        job.pop(SCHEDULE_EXPR_KEY, None)
-    job["next_run_at"] = parked
-    job[STATE_KEY] = parked
+    paused_at = _window_end(hold_seconds).isoformat()
+    job["enabled"] = False
+    job["state"] = "paused"
+    job["next_run_at"] = None
+    job["paused_at"] = _hermes_now().isoformat()
+    job["paused_reason"] = "Provider quota exhausted; explicit operator resume required"
+    job[STATE_KEY] = paused_at
+    job.pop(SCHEDULE_EXPR_KEY, None)
     logger.warning(
-        "Job '%s': provider usage window closed for %.0fs — holding fires until %s instead of "
-        "failing on every cadence tick",
-        job.get("name", job.get("id", "?")), float(hold_seconds), parked)
+        "Job '%s': provider usage window closed for %.0fs — paused pending explicit operator resume",
+        job.get("name", job.get("id", "?")), float(hold_seconds))
     return True
 
 
@@ -158,6 +146,6 @@ def hold_notice(job: dict[str, Any], hold_seconds: Optional[float]) -> str:
     hours = float(hold_seconds) / 3600.0
     return (
         f"\nThe provider's usage window is closed for about {hours:.1f}h. This job is held "
-        f"through {safe_strftime(window_end, '%Y-%m-%d %H:%M %Z')} and resumes at the first safe "
-        "opportunity afterwards; no further alerts are sent while the provider is unavailable."
+        f"through at least {safe_strftime(window_end, '%Y-%m-%d %H:%M %Z')}. It has been paused "
+        "and will not resume automatically when quota resets; an operator must explicitly resume it."
     )

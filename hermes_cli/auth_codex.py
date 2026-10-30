@@ -653,7 +653,9 @@ def resolve_codex_runtime_credentials(
             # reset early (banked reset redeemed, plan upgraded): ``last_error_reset_at`` can be
             # days in the future while the account is already usable again. Never from a
             # read-only caller: the picker fingerprint resolves on every cache-only read.
-            if not read_only and _probe_codex_pool_entry_quota_restored(pool_rate_limit):
+            from agent.automated_model_authorization import is_automated_execution
+            if (not read_only and not is_automated_execution()
+                    and _probe_codex_pool_entry_quota_restored(pool_rate_limit)):
                 logger.info("Codex quota restored upstream — clearing stale pool cooldown(s).")
                 clear_codex_pool_quota_cooldowns()
                 pool_token, pool_base = _pool_codex_credential()
