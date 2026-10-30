@@ -433,9 +433,7 @@ def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_h
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
-    """Within the cooldown after a rate-limit requeue, the guard defers the
-    respawn; after the cooldown it allows a probe — and crucially does NOT
-    fall into ``blocker_auth`` (which would defer forever)."""
+    """Quota reset/cooldown expiry never resumes work without an operator event."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
@@ -459,13 +457,19 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         )
         conn.commit()
 
-        # Inside cooldown → defer with the rate-limit-specific reason.
+        # Inside and after the old cooldown boundary, automatic respawn stays blocked.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
-        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_manual_resume"
 
-        # Past cooldown → allowed (None), NOT trapped by blocker_auth even
-        # though last_failure_error contains "rate-limited".
         monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_manual_resume"
+
+        # A later explicit operator lifecycle event permits one new attempt.
+        conn.execute(
+            "INSERT INTO task_events(task_id, kind, payload, created_at) VALUES(?, ?, ?, ?)",
+            (tid, "unblocked", "{}", now + 401),
+        )
+        conn.commit()
         assert kbd.check_respawn_guard(conn, tid) is None
 
 

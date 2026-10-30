@@ -1032,6 +1032,8 @@ def _relocate_basetemp_outside_operator_home(config) -> None:
     native = _get_platform_default_hermes_home().resolve()
     factory = config._tmp_path_factory
     given = factory._given_basetemp
+    if given is not None:
+        return
     candidate = given if given is not None else Path(
         os.environ.get("PYTEST_DEBUG_TEMPROOT") or tempfile.gettempdir()
     )

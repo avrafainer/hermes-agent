@@ -56,6 +56,11 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
 
+# Server-attested proof for one live Desktop prompt.  Deliberately absent from
+# _SESSION_VARS/_VAR_MAP: it must never fall back to os.environ or cross a
+# subprocess boundary as a HERMES_* variable.
+_ATTENDED_DESKTOP_TURN = ContextVar("HERMES_ATTENDED_DESKTOP_TURN", default=False)
+
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
@@ -137,7 +142,7 @@ def set_session_vars(
     message_id: str = "", profile: str = "", browser_control_principal: str = "",
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
-    session_history_delivery: str | None = None,
+    session_history_delivery: str | None = None, attended_desktop: bool = False,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -158,6 +163,7 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    tokens.append(_ATTENDED_DESKTOP_TURN.set(attended_desktop is True))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -172,6 +178,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _ATTENDED_DESKTOP_TURN.set(False)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -185,6 +192,7 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _ATTENDED_DESKTOP_TURN.set(False)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -195,6 +203,11 @@ def get_session_env(name: str, default: str = "") -> str:
     if var is not None and (value := var.get()) is not _UNSET:
         return value
     return os.getenv(name, default)
+
+
+def attended_desktop_turn() -> bool:
+    """True only inside the prompt scope attested by the Desktop backend."""
+    return _ATTENDED_DESKTOP_TURN.get() is True
 
 
 # Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/

@@ -91,6 +91,10 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        from agent.interactive_spending import route_attended_openrouter_request
+
+        next_api_kwargs = route_attended_openrouter_request(
+            next_api_kwargs, provider=agent.provider, base_url=agent.base_url)
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),

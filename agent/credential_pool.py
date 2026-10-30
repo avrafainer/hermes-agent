@@ -1908,6 +1908,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         429/quota-shaped errors; the probe is throttled per token (5 min) so
         it is safe on the hot selection path.
         """
+        from agent.automated_model_authorization import is_automated_execution
+
+        if is_automated_execution():
+            return False
         if self.provider != "openai-codex" or entry.last_status != STATUS_EXHAUSTED:
             return False
         if not auth_mod._is_codex_rate_limit_shaped(

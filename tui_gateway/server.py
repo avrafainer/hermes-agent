@@ -1065,12 +1065,19 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             if _methods_browser_control._is_authenticated_identity(identity):
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
                 browser_control_transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY
+        attended_desktop = bool(
+            sess is not None
+            and ui_session_id
+            and source == "desktop"
+            and _resolve_session_platform() == "desktop"
+            and sess.get("transport") is not None
+        )
         return set_session_vars(
             session_key=session_key, session_id=session_id, source=source,
             profile=profile,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
-            ui_session_id=ui_session_id, cron_session="")
+            ui_session_id=ui_session_id, cron_session="", attended_desktop=attended_desktop)
     return []
 
 

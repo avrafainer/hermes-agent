@@ -67,6 +67,10 @@ class _FakeAnthropicStream:
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Strip provider env vars so each test starts clean."""
+    # These are auxiliary routing unit tests.  The spend guard has its own
+    # fail-closed contract suite; letting it read per-user accounting state
+    # here would prevent the mocked provider boundary from being exercised.
+    monkeypatch.setattr("hermes_cli.local_spend_guard.enforce", lambda **_kwargs: None)
     for key in (
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import run_agent
 import cron.scheduler as sched
 from cron import quota_hold as qh
 from cron.jobs import (
@@ -52,11 +53,10 @@ def test_hold_seconds_only_from_rate_limited_auth_error_in_cause_chain():
     assert qh.hold_seconds_from_failure(structured) == 900.0
 
 
-def test_weekly_cron_retries_when_quota_recovers_before_next_occurrence(
+def test_weekly_cron_pauses_instead_of_retrying_when_quota_recovers(
     tmp_cron_home, monkeypatch,
 ):
-    """A weekly fire blocked by a shorter quota window retries when the provider reopens;
-    it is not silently deferred until the following week's natural occurrence."""
+    """A provider reset boundary does not authorize an unattended recovery fire."""
     now = datetime(2026, 9, 18, 12, 1, tzinfo=UTC)
     natural_next = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
     monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
@@ -71,20 +71,14 @@ def test_weekly_cron_retries_when_quota_recovers_before_next_occurrence(
 
     held = get_job(job["id"])
     assert held is not None
-    retry_at = datetime.fromisoformat(held["next_run_at"])
-    assert retry_at == now + timedelta(hours=20, seconds=qh.HOLD_SLACK_SECONDS) < natural_next
-    assert qh.is_recovery_fire(held, held["next_run_at"])
-    edited = {**held, "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
-    assert not qh.is_recovery_fire(edited, edited["next_run_at"])
-
-    monkeypatch.setattr("cron.jobs._hermes_now", lambda: retry_at + timedelta(seconds=1))
-    assert job["id"] in {due["id"] for due in get_due_jobs()}
+    assert held["state"] == "paused"
+    assert held["enabled"] is False
+    assert held["next_run_at"] is None
+    assert "explicit operator resume" in held["paused_reason"]
+    assert job["id"] not in {due["id"] for due in get_due_jobs()}
 
 
-def test_recovery_fire_skips_dense_schedules_and_never_re_parks(monkeypatch):
-    """Recovery is one attempt for sparse schedules only: an hourly job whose hold ends two
-    minutes before :00 keeps its natural :00 (no off-lattice near-duplicate), and a job that is
-    already the recovery fire (carries quota_hold_until) failing again is not re-parked."""
+def test_quota_pause_applies_to_dense_schedule_and_is_idempotent(monkeypatch):
     now = datetime(2026, 9, 18, 12, 1, tzinfo=UTC)
     monkeypatch.setattr(qh, "_hermes_now", lambda: now)
 
@@ -92,22 +86,14 @@ def test_recovery_fire_skips_dense_schedules_and_never_re_parks(monkeypatch):
         "schedule": {"kind": "cron", "expr": "0 * * * *"},
         "next_run_at": datetime(2026, 9, 18, 13, 0, tzinfo=UTC).isoformat(),
     }
-    natural = dense["next_run_at"]
-    assert not qh.plan_hold(dense, hold_seconds=57 * 60 - qh.HOLD_SLACK_SECONDS,
-                            recover_consumed_fire=True)
-    assert dense["next_run_at"] == natural
+    assert qh.plan_hold(dense, hold_seconds=57 * 60 - qh.HOLD_SLACK_SECONDS,
+                        recover_consumed_fire=True)
+    assert dense["state"] == "paused"
+    assert dense["enabled"] is False
+    assert dense["next_run_at"] is None
+    dense[qh.STATE_KEY]
+    assert not qh.plan_hold(dense, hold_seconds=20 * 60 * 60, recover_consumed_fire=True)
     assert qh.STATE_KEY not in dense
-
-    held_again = {
-        "schedule": {"kind": "cron", "expr": "0 12 * * 5"},
-        "next_run_at": (now + timedelta(days=7)).isoformat(),
-        qh.STATE_KEY: now.isoformat(),
-        qh.SCHEDULE_EXPR_KEY: "0 12 * * 5",
-    }
-    natural = held_again["next_run_at"]
-    assert not qh.plan_hold(held_again, hold_seconds=20 * 60 * 60, recover_consumed_fire=True)
-    assert held_again["next_run_at"] == natural
-    assert qh.STATE_KEY not in held_again
 
 
 def _raise_quota(**_kw):
@@ -131,7 +117,7 @@ def _tick(job, home, deliveries, resolve):
         sched.run_one_job(dict(job))
 
 
-def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_reach(tmp_cron_home, cron_owner):
+def test_quota_hold_pauses_and_requires_explicit_resume(tmp_cron_home, cron_owner):
     """A 30-minute job whose provider resolve raises the Codex quota AuthError ('retry after
     123518s') is parked by the real scheduler tick: preflight lets the rate-limited AuthError
     through (it is not a missing credential), the one delivered alert carries the hold notice,
@@ -149,9 +135,10 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     j = get_job(job_id)
     assert j["last_status"] == "error"
     assert len(deliveries) == 1, deliveries
-    parked = datetime.fromisoformat(j["next_run_at"])
-    assert parked - now >= timedelta(seconds=123518), "next_run_at must land past the window"
-    assert j[qh.STATE_KEY] == j["next_run_at"]
+    assert j["state"] == "paused"
+    assert j["enabled"] is False
+    assert j["next_run_at"] is None
+    assert datetime.fromisoformat(j[qh.STATE_KEY]) - now >= timedelta(seconds=123518)
     assert "_quota_hold_seconds" not in j
 
     # Two hours later the job looks like a wedged stale-error record (#62002) — the hold says
@@ -160,18 +147,10 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     j = get_job(job_id)
     assert not _job_is_stale_error_recurring(j, j["schedule"], now)
     assert all(d["id"] != job_id for d in get_due_jobs())
-    assert datetime.fromisoformat(get_job(job_id)["next_run_at"]) == parked
-
-    # A run that reached the model (either outcome) clears the marker.
-    assert mark_job_run(job_id, False, "RuntimeError: model said no")
-    j = get_job(job_id)
-    assert qh.STATE_KEY not in j
-    assert datetime.fromisoformat(j["next_run_at"]) - now < timedelta(hours=1)
+    assert get_job(job_id)["next_run_at"] is None
 
     # Editing the schedule recomputes next_run_at from the new cadence; the stale marker must
     # not linger on a record that is no longer parked where it says.
-    assert mark_job_run(job_id, False, QUOTA_MSG, quota_hold_seconds=123518)
-    assert qh.STATE_KEY in get_job(job_id)
     j = update_job(job_id, {"schedule": "every 15m"})
     assert qh.STATE_KEY not in j
-    assert datetime.fromisoformat(j["next_run_at"]) - now < timedelta(hours=1)
+    assert j["state"] == "paused"
