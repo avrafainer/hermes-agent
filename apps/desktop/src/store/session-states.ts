@@ -93,7 +93,12 @@ import {
   type SessionOwnerScope,
   type SessionProfileRoute
 } from './session-request-router'
-import { ackStoredSessionId, isMessagingCompletion, markSessionUnreadFinished } from './session-unread'
+import {
+  $unreadFinishedMarkers,
+  ackStoredSessionId,
+  isMessagingCompletion,
+  markSessionUnreadFinished
+} from './session-unread'
 import { clearUnreadOnOpen } from './session-unread-remote'
 import { migrateTranscriptTailsForProfile } from './transcript-tail-cache'
 import { isBrowserWindow, isSecondaryWindow } from './windows'
@@ -3073,21 +3078,46 @@ function stampTileSessionFocus(focused: null | string) {
 // Clears the whole conversation family (markSessionRead) AND acks the
 // persisted watermark/marker (ackStoredSessionId) so the next list refresh
 // doesn't repaint the dot the user just cleared by looking at it.
-$focusedStoredSessionId.listen(focused => {
-  if (focused) {
-    markSessionRead(focused)
-    ackStoredSessionId(focused)
-    // The local marker is not the only record: the backend watermark is what repaints the
-    // dot on the next list refresh, and only the main-selection path used to clear it. A
-    // session fronted as a tile or inside a workspace never takes that path, so its dot
-    // came back every refresh no matter how many times it was opened.
-    clearUnreadOnOpen(focused).catch(() => {})
+function ackSessionAsSeen(storedSessionId: null | string) {
+  if (!storedSessionId) {
+    return
   }
 
+  markSessionRead(storedSessionId)
+  ackStoredSessionId(storedSessionId)
+  // The local marker is not the only record: the backend watermark is what repaints the
+  // dot on the next list refresh, and only the main-selection path used to clear it. A
+  // session fronted as a tile or inside a workspace never takes that path, so its dot
+  // came back every refresh no matter how many times it was opened.
+  clearUnreadOnOpen(storedSessionId).catch(() => {})
+}
+
+$focusedStoredSessionId.listen(focused => {
+  ackSessionAsSeen(focused)
   stampTileSessionFocus(focused)
 })
 
 stampTileSessionFocus($focusedStoredSessionId.get())
+
+// Boot restore and list refreshes never CHANGE focus, so a marker persisted by an earlier
+// run leaves the green dot on the session you are already looking at, and nothing clears
+// it until you switch away and back. Ack the restored focus once, then again whenever the
+// list repopulates while the focused session is still marked.
+ackSessionAsSeen($focusedStoredSessionId.get())
+
+$sessions.listen(() => {
+  const focused = $focusedStoredSessionId.get()
+
+  if (!focused) {
+    return
+  }
+
+  const marked = Object.values($unreadFinishedMarkers.get()).some(ids => ids?.includes(focused))
+
+  if (marked) {
+    ackSessionAsSeen(focused)
+  }
+})
 
 // Cold-start restore is the one selection change that is NOT a navigation: the
 // route already pointed at the primary session before the window loaded, and
