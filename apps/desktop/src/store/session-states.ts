@@ -94,6 +94,7 @@ import {
   type SessionProfileRoute
 } from './session-request-router'
 import { ackStoredSessionId, isMessagingCompletion, markSessionUnreadFinished } from './session-unread'
+import { clearUnreadOnOpen } from './session-unread-remote'
 import { migrateTranscriptTailsForProfile } from './transcript-tail-cache'
 import { isBrowserWindow, isSecondaryWindow } from './windows'
 
@@ -3076,6 +3077,11 @@ $focusedStoredSessionId.listen(focused => {
   if (focused) {
     markSessionRead(focused)
     ackStoredSessionId(focused)
+    // The local marker is not the only record: the backend watermark is what repaints the
+    // dot on the next list refresh, and only the main-selection path used to clear it. A
+    // session fronted as a tile or inside a workspace never takes that path, so its dot
+    // came back every refresh no matter how many times it was opened.
+    clearUnreadOnOpen(focused).catch(() => {})
   }
 
   stampTileSessionFocus(focused)
