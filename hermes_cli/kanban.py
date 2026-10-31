@@ -345,6 +345,25 @@ def _cmd_create(args: argparse.Namespace) -> int:
         except OSError as exc:
             return _err(f"kanban: --body-file: {exc}", 2)
 
+    # Cost gate at the CLI boundary. new_card.py checks this too, but this command
+    # is the documented way to bypass that wrapper, and on 2026-10-31 a card created
+    # here ran a $18 read against a $5.45 projection. A card that sends a worker into
+    # corpus files must declare a measured cost; new_card.py only writes that line
+    # after cost_gate.py has checked it against measured samples.
+    if body and "Declared cost:" not in body:
+        _bulk_markers = (
+            "ledger/corpus", "archive-sources/", "read in chunks",
+            "per conversation", "corpus-export", "chatgpt-export",
+        )
+        if any(m in body for m in _bulk_markers) and os.environ.get("HERMES_ALLOW_UNCOSTED") != "1":
+            return _err(
+                "kanban: refused: this card reads corpus files in bulk but declares no "
+                "measured cost.\n"
+                "  Use ~/.hermes/scripts/new_card.py --cost-mb <MB> --cost-files <n> "
+                "--cost-review yes|no so a measured rate and a ceiling apply.\n"
+                "  To override deliberately: HERMES_ALLOW_UNCOSTED=1 hermes kanban create ...",
+                4)
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
