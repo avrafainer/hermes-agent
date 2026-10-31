@@ -67,7 +67,21 @@ export async function markSessionUnread(storedId: string, unread: boolean): Prom
 export async function clearUnreadOnOpen(storedId: string): Promise<void> {
   const row = rowFor(storedId)
 
-  if (!row || row.unread !== true) {
+  // A session with no loaded row — a tile, a workspace pane, a session owned by a profile the
+  // list has not loaded — still has a server-side watermark, and returning here was why its dot
+  // never cleared: the PATCH that would have cleared it was never sent, so every refresh read
+  // unread=true straight back off the server.
+  if (!row) {
+    try {
+      await setSessionUnreadRemote(storedId, false)
+    } catch {
+      // Ignore: the dot simply returns until a refresh reconciles.
+    }
+
+    return
+  }
+
+  if (row.unread !== true) {
     return
   }
 
