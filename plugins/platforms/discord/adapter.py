@@ -3265,6 +3265,16 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             # Backfill replays from this table: record the dropped final reply as failed or it is lost.
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
         try:
+            # Standing rules run on the send path, not on trust: em dashes are rewritten
+            # and a message offering a choice is held rather than delivered.
+            try:
+                from hermes_cli.outbound_guard import guard as _outbound_guard
+                _g = _outbound_guard(content)
+                if _g.em_dashes_fixed:
+                    logger.info("outbound guard rewrote %d em dash(es) before send", _g.em_dashes_fixed)
+                content = _g.text
+            except Exception as _guard_exc:  # never block delivery on the guard itself
+                logger.warning("outbound guard failed open: %s", _guard_exc)
             thread_id = None
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
