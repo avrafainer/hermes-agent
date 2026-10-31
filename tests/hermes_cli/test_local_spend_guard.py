@@ -149,3 +149,30 @@ def test_recovery_and_grace_commands_are_retired(budget_home, monkeypatch):
         monkeypatch.setattr("sys.argv", ["hermes-budget", action])
         with pytest.raises(SystemExit):
             guard.main()
+
+
+def _attested(monkeypatch, source, *, attested=True):
+    from agent import interactive_spending
+
+    monkeypatch.setattr(guard, "_session_identity_fields", lambda: (source, "conv", "win", ""))
+    monkeypatch.setattr(interactive_spending, "is_attended_desktop_provider_request", lambda: attested)
+    return guard._current_interactive_identity()
+
+
+def test_gateway_served_chat_keeps_the_interactive_identity(monkeypatch):
+    """A Desktop or Hermex chat served by a shared gateway reports `gui`, not `desktop`.
+
+    The gateway mints the attended proof only for a server-minted transport identity,
+    so withholding the interactive key on the surface label alone put a human's chat
+    back on the unattended daily cap.
+    """
+    for source in ("desktop", "gui", "tui", "local"):
+        identity = _attested(monkeypatch, source)
+        assert identity is not None, source
+        assert identity["source"] == source
+
+
+def test_messaging_and_unattested_turns_get_no_interactive_identity(monkeypatch):
+    for source in ("telegram", "discord", "cron", "kanban", "api_server"):
+        assert _attested(monkeypatch, source) is None, source
+    assert _attested(monkeypatch, "gui", attested=False) is None

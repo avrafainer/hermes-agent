@@ -181,12 +181,19 @@ def _has_unattended_marker(cron=""):
         return True
 
 
+_ATTENDED_CHAT_SOURCES = frozenset({"desktop", "gui", "tui", "local"})
+
+
 def _current_interactive_identity():
-    """Server-attested identity for the exact attended Desktop turn, or None."""
+    """Server-attested identity for the exact attended chat turn, or None."""
     source, session_id, ui_session_id, cron = _session_identity_fields()
     from agent.interactive_spending import is_attended_desktop_provider_request
 
-    if (source != "desktop" or not session_id or not ui_session_id or cron
+    # A Desktop app or Hermex client served by a shared gateway reports `gui`, not
+    # `desktop`. The proof itself is what authorizes the interactive key — the gateway
+    # only mints it for a transport identity minted at WS upgrade — so the surface name
+    # must not re-narrow the same population the gateway just attested.
+    if (source not in _ATTENDED_CHAT_SOURCES or not session_id or not ui_session_id or cron
             or not is_attended_desktop_provider_request()):
         return None
     return {"source": source, "session_id": session_id, "ui_session_id": ui_session_id,
