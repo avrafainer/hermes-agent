@@ -1342,6 +1342,9 @@ def _save_cfg(cfg: dict):
             _cfg_sig = None
 
 
+_ATTENDED_GATEWAY_SOURCES = frozenset({"desktop", "gui", "tui", "local"})
+
+
 def _session_for_key(session_key: str) -> dict | None:
     """First live record with this session_key (snapshot under the lock: pool handlers mutate ``_sessions``)."""
     with _sessions_lock:
@@ -1361,6 +1364,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         # Live conversation id for subprocess HERMES_SESSION_ID: an explicitly empty contextvar is authoritative
         # (no os.environ fallback), so never leave it "" — agent's durable session_id, then session_key.
         session_id = session_key
+        identity = None
         if sess is not None:
             source = _session_source(sess)
             # App-global backends multiplex profiles: prefer the live session's own home.
@@ -1373,9 +1377,20 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         attended_desktop = bool(
             sess is not None
             and ui_session_id
-            and source == "desktop"
-            and _resolve_session_platform() == "desktop"
             and sess.get("transport") is not None
+            and (
+                (source == "desktop" and _resolve_session_platform() == "desktop")
+                # A signed-in dashboard client (the Desktop app or Hermex over a shared
+                # gateway) is the same human at the same keyboard as the app's bundled
+                # backend. The identity is minted at WS upgrade and never taken from the
+                # client, so this cannot be spoofed by a bare surface label. Without this
+                # arm, pointing a Desktop at a remote gateway silently demotes its chats to
+                # unattended and the dedicated interactive key goes unused.
+                or (
+                    source in _ATTENDED_GATEWAY_SOURCES
+                    and _methods_browser_control._is_authenticated_identity(identity)
+                )
+            )
         )
         return set_session_vars(
             session_key=session_key, session_id=session_id, source=source,
