@@ -134,6 +134,10 @@ class DispatchResult:
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+    skipped_spend_capped: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` refused before any claim or subprocess because the
+    unattended spend lane is spent. Nothing ran, so no retry budget is touched;
+    the card stays queued and is picked up once the lane has room."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
@@ -168,6 +172,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             continue
         for _task_id, reason in res.respawn_guarded:
             counts[reason] = counts.get(reason, 0) + 1
+        if res.skipped_spend_capped:
+            counts["spend_capped"] = counts.get("spend_capped", 0) + len(res.skipped_spend_capped)
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
@@ -2035,6 +2041,13 @@ def dispatch_once(
     return result
 
 
+def _spend_gate():
+    """Late import: keeps the dispatcher importable when the guard is absent."""
+    from hermes_cli import spend_gate
+
+    return spend_gate
+
+
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
@@ -2096,6 +2109,26 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # Spend ceiling at the spawn boundary. The wire-level guard already refuses a
+    # paid request, so a worker spawned into a spent lane would only burn a claim,
+    # a cold start and a card that looks crashed. Refuse before the claim instead,
+    # and leave the retry budget untouched: being out of budget is not the card's
+    # fault and it must resume when the lane refills.
+    allowed, spend_reason = _spend_gate().check_spawn_allowed(assignee)
+    if not allowed:
+        result.skipped_spend_capped.append((task_id, spend_reason))
+        if not dry_run:
+            with _kb.write_txn(conn):
+                last = conn.execute(
+                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                if (last is None or last["kind"] != "spawn_refused_spend_cap"
+                        or last["payload"] != _kb._json_or_null({"reason": spend_reason})):
+                    _kb._append_event(conn, task_id, "spawn_refused_spend_cap",
+                                      {"reason": spend_reason})
+        _kb._log.warning("kanban dispatcher: %s held back, spend lane is spent: %s",
+                         task_id, spend_reason)
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
