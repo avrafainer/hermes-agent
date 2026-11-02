@@ -1069,8 +1069,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             sess is not None
             and ui_session_id
             and source == "desktop"
-            and _resolve_session_platform() == "desktop"
-            and sess.get("transport") is not None
+            and _session_has_live_transport(sess)
         )
         return set_session_vars(
             session_key=session_key, session_id=session_id, source=source,

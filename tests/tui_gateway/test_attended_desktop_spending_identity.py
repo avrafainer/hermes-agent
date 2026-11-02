@@ -13,8 +13,8 @@ def _session(*, source="desktop", transport=object()):
     }
 
 
-def test_live_desktop_prompt_mints_request_scoped_proof(monkeypatch):
-    monkeypatch.setenv("HERMES_DESKTOP", "1")
+def test_shared_backend_live_desktop_prompt_mints_request_scoped_proof(monkeypatch):
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
     monkeypatch.setitem(server._sessions, "window", _session())
     tokens = server._set_session_context("conversation", ui_session_id="window")
@@ -37,7 +37,7 @@ def test_source_label_without_live_desktop_transport_cannot_mint_proof(monkeypat
 
 def test_tui_or_messaging_session_cannot_mint_desktop_proof(monkeypatch):
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
-    monkeypatch.setitem(server._sessions, "window", _session())
+    monkeypatch.setitem(server._sessions, "window", _session(source="tui"))
     tokens = server._set_session_context("conversation", ui_session_id="window")
     try:
         assert attended_desktop_turn() is False
