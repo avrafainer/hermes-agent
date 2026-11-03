@@ -105,6 +105,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_session_capped": [
+                {"task_id": tid, "assignee": who, "sessions_today": started}
+                for (tid, who, started) in res.skipped_session_capped
+            ],
             "auto_assigned_default": res.auto_assigned_default,
             "respawn_guarded": [
                 {"task_id": tid, "reason": reason}

@@ -234,7 +234,7 @@ def notify_task_updated(
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
-    "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
+    "respawn_guarded", "skipped_per_profile_capped", "skipped_session_capped", "skipped_unassigned",
     "skipped_nonspawnable",
 )
 
@@ -929,7 +929,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Hermes session id of the worker that ran this attempt. Recorded when the
+    -- worker closes its own run (from HERMES_SESSION_ID) or, for a worker that
+    -- died, parsed out of its log trailer at reap. It is what lets a card's
+    -- spend be looked up instead of estimated.
+    session_id          TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1153,6 +1158,41 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+# Words a card body uses when it already states how the worker finishes. Checked
+# case-insensitively; any one of them means the operator wrote a contract and we
+# leave the body alone rather than stacking a second one on top.
+_EXIT_CONTRACT_MARKERS = ("exit contract", "done when", "done-when", "definition of done",
+                          "stop when", "acceptance criteria", "completion contract")
+
+EXIT_CONTRACT_TEMPLATE = """
+## Exit contract
+
+- **Finish by claiming it.** End with `kanban complete <id>` and a one-to-three sentence summary,
+  or `kanban block <id>` with the reason if you cannot. A run that ends without one of those
+  leaves the board unable to tell finished work from abandoned work.
+- **Verify before claiming.** Run the check named above and put the command and its real output
+  in the summary. Do not describe a result you did not observe.
+- **Stop when the stated outcome is met.** Do not widen the scope, fix adjacent things, or start
+  a review pass because it is possible.
+"""
+
+
+def ensure_exit_contract(body: Optional[str], title: str = "") -> str:
+    """Return ``body`` with an exit contract, adding the standard one if absent.
+
+    A card whose body never says how the worker finishes is the card whose worker
+    ends silently: 34 of them did exactly that before this existed, and the board
+    could not tell them from cards that were never picked up.
+    """
+    text = (body or "").strip()
+    lowered = text.lower()
+    if text and any(marker in lowered for marker in _EXIT_CONTRACT_MARKERS):
+        return body if body is not None else text
+    if not text:
+        text = f"## Task\n\n{title.strip() or 'As titled.'}"
+    return text.rstrip() + "\n" + EXIT_CONTRACT_TEMPLATE
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1240,6 +1280,12 @@ def create_task(
         board_default = _board_meta_for(board).get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    # Every card that a profile will actually be asked to execute carries an exit
+    # contract, whether or not its author remembered one. Cards with no assignee
+    # are excluded: nothing runs them, so the contract would be decoration.
+    if assignee:
+        body = ensure_exit_contract(body, title)
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -1868,6 +1914,10 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    # The worker that calls this is the only process that knows its own Hermes
+    # session, so capture it here while it is in scope. COALESCE keeps a value
+    # already parsed from the log rather than overwriting it with a blank.
+    worker_session = os.environ.get("HERMES_SESSION_ID") or None
     conn.execute(
         """
         UPDATE task_runs
@@ -1877,11 +1927,13 @@ def _end_run(
                error         = ?,
                metadata      = ?,
                ended_at      = ?,
-               claim_expires = NULL
+               claim_expires = NULL,
+               session_id    = COALESCE(session_id, ?)
          WHERE id = ?
            AND ended_at IS NULL
         """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+        (status or outcome, outcome, summary, error, _json_or_null(metadata), now,
+         worker_session, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id

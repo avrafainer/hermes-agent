@@ -943,6 +943,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
+    # task_runs.session_id arrived with P5.2; legacy boards get it back-filled as
+    # NULL, which is honest - those runs' sessions are gone.
+    if "session_id" not in _column_names(conn, "task_runs"):
+        _add_column_if_missing(conn, "task_runs", "session_id", "session_id TEXT")
+
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
     # so a ``CREATE INDEX`` over a missing column in SCHEMA_SQL would abort

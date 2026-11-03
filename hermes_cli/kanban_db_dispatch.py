@@ -122,6 +122,11 @@ class DispatchResult:
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
     on multi-lane setups, NOT operator-actionable; tracked apart so health
     telemetry can tell "stuck" from "correctly idle"."""
+    skipped_session_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """``(task_id, assignee, sessions_today)`` for ready cards left alone because
+    that profile has already started ``kanban.max_sessions_per_profile_per_day``
+    workers today. Distinct from the *concurrency* cap: this one is a daily budget
+    of launches, so it does not clear when the profile's workers finish."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -516,7 +521,8 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     One row's failure (signal, /proc probe) is logged and skips only that row.
     Returns the task ids whose worker was terminated."""
     rows = conn.execute(
-        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock FROM task_runs "
+        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock, session_id "
+        "FROM task_runs "
         "WHERE ended_at IS NOT NULL AND ended_at <= ? "
         "AND worker_pid IS NOT NULL AND worker_started_at IS NOT NULL",
         (int(time.time()) - TERMINAL_WORKER_REAP_GRACE_SECONDS,),
@@ -553,6 +559,14 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
             "WHERE id = ? AND worker_pid = ? AND worker_started_at = ?",
             (row["id"], pid, fingerprint),
         )
+        # This worker will never report its session itself, so read it out of the
+        # log now, while the row is in hand. Without it the card's spend stays
+        # unattributable for exactly the runs that failed.
+        if row["session_id"] is None:
+            session_id = _session_id_from_log(row["task_id"])
+            if session_id:
+                conn.execute("UPDATE task_runs SET session_id = ? WHERE id = ?",
+                             (session_id, row["id"]))
         if alive:
             _kb._append_event(
                 conn, row["task_id"], "terminal_worker_reaped",
@@ -2061,6 +2075,51 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _max_sessions_per_profile_per_day() -> Optional[int]:
+    """Daily worker-launch ceiling for one profile, or None when unset.
+
+    ``kanban.max_sessions_per_profile_per_day``. Separate from
+    ``max_in_progress_per_profile``: that one is concurrency (how many may run at
+    once), this one is a day's worth of launches. 615 sessions in twelve days was
+    51 a day against a ceiling of four, each paying a cold start and a cache write.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "max_sessions_per_profile_per_day")
+    except Exception:
+        return None
+    try:
+        value = int(raw) if raw is not None and str(raw).strip() != "" else None
+    except (TypeError, ValueError):
+        return None
+    return value if value and value > 0 else None
+
+
+def _sessions_started_today(conn: sqlite3.Connection, profile: str) -> int:
+    """Worker runs this profile started since local midnight (runs, not cards)."""
+    lt = time.localtime()
+    midnight = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_runs WHERE profile = ? AND started_at >= ?",
+        (profile, midnight),
+    ).fetchone()
+    return int(row["n"] if row is not None else 0)
+
+
+_SESSION_ID_IN_LOG_RE = re.compile(r"session_id:\s*([A-Za-z0-9_\-]+)")
+
+
+def _session_id_from_log(task_id: str) -> str:
+    """Best-effort session id from a worker's log trailer; "" when absent."""
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=12000)
+    except Exception:
+        return ""
+    match = _SESSION_ID_IN_LOG_RE.search(raw or "")
+    return match.group(1) if match else ""
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2108,6 +2167,24 @@ def _dispatch_lane_task(
         current = per_profile_running.get(assignee, 0)
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
+            return False
+    # Daily launch budget for this profile. Checked before the claim so a refusal
+    # leaves the retry budget and the card's history untouched; the event says how
+    # many it has already started, so the board answers "why is this stuck".
+    session_cap = _max_sessions_per_profile_per_day()
+    if session_cap is not None:
+        started = _sessions_started_today(conn, assignee)
+        if started >= session_cap:
+            result.skipped_session_capped.append((task_id, assignee, started))
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    last = conn.execute(
+                        "SELECT kind FROM task_events WHERE task_id = ? "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                    if last is None or last["kind"] != "spawn_refused_session_cap":
+                        _kb._append_event(conn, task_id, "spawn_refused_session_cap",
+                                          {"profile": assignee, "cap": session_cap,
+                                           "sessions_today": started})
             return False
     # Spend ceiling at the spawn boundary. The wire-level guard already refuses a
     # paid request, so a worker spawned into a spent lane would only burn a claim,
