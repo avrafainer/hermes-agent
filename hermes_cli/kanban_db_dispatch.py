@@ -122,6 +122,11 @@ class DispatchResult:
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
     on multi-lane setups, NOT operator-actionable; tracked apart so health
     telemetry can tell "stuck" from "correctly idle"."""
+    skipped_attempts_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """``(task_id, assignee, attempts_today)`` for a card left alone because it has
+    already been launched ``kanban.max_attempts_per_card_per_day`` times today.
+    The lane budget below counts *all* launches; this counts one card's, which is
+    the only way to notice a single card thrashing without starving the others."""
     skipped_session_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, sessions_today)`` for ready cards left alone because
     that profile has already started ``kanban.max_sessions_per_profile_per_day``
@@ -2075,13 +2080,44 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
-def _max_sessions_per_profile_per_day() -> Optional[int]:
+def _ceiling_int(raw: object) -> Optional[int]:
+    """``raw`` as a ceiling, or None when it is unset, empty or nonsense."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _daily_launch_cap(raw: object, profile: str) -> Optional[int]:
+    """Resolve ``kanban.max_sessions_per_profile_per_day`` for one profile.
+
+    The value is either a single int (every profile gets it) or a map from profile
+    name to int with an optional ``default`` for the ones it does not name. Lanes
+    are not comparable — the Pi lane bursts to 300+ launches on a batch day while
+    ``chief-of-staff`` has taken twelve in a fortnight — so one flat number either
+    walls off the busy lane or is useless on the quiet ones.
+    """
+    if isinstance(raw, Mapping):
+        named = _ceiling_int(raw.get(profile))
+        if named is not None:
+            return named
+        # "_default" is the fallback key: a profile is actually named "default" on
+        # this machine, so a bare "default" has to mean that lane, not everyone else.
+        return _ceiling_int(raw.get("_default", raw.get("default")))
+    return _ceiling_int(raw)
+
+
+def _max_sessions_per_profile_per_day(profile: str = "") -> Optional[int]:
     """Daily worker-launch ceiling for one profile, or None when unset.
 
-    ``kanban.max_sessions_per_profile_per_day``. Separate from
-    ``max_in_progress_per_profile``: that one is concurrency (how many may run at
-    once), this one is a day's worth of launches. 615 sessions in twelve days was
-    51 a day against a ceiling of four, each paying a cold start and a cache write.
+    ``kanban.max_sessions_per_profile_per_day``, as an int or a profile map.
+    Separate from ``max_in_progress_per_profile``: that one is concurrency (how many
+    may run at once), this one is a day's worth of launches. 615 sessions in twelve
+    days was 51 a day against a ceiling of four, each paying a cold start and a
+    cache write.
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -2089,20 +2125,45 @@ def _max_sessions_per_profile_per_day() -> Optional[int]:
             "max_sessions_per_profile_per_day")
     except Exception:
         return None
+    return _daily_launch_cap(raw, profile)
+
+
+def _max_attempts_per_card_per_day() -> Optional[int]:
+    """How many launches one *card* may have in a day before it is left alone.
+
+    ``kanban.max_attempts_per_card_per_day``. The daily lane budget cannot catch a
+    single card thrashing: on 2026-10-30 the Pi lane spent 726 runs over 179 cards
+    and some batch cards were launched 9-11 times, which a lane-wide number only
+    notices by refusing everyone else too. Unset (or 0) means no per-card ceiling.
+    """
     try:
-        value = int(raw) if raw is not None and str(raw).strip() != "" else None
-    except (TypeError, ValueError):
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "max_attempts_per_card_per_day")
+    except Exception:
         return None
-    return value if value and value > 0 else None
+    return _ceiling_int(raw)
+
+
+def _local_midnight() -> int:
+    lt = time.localtime()
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+
+
+def _attempts_today(conn: sqlite3.Connection, task_id: str) -> int:
+    """Launches this one card has had since local midnight."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ? AND started_at >= ?",
+        (task_id, _local_midnight()),
+    ).fetchone()
+    return int(row["n"] if row is not None else 0)
 
 
 def _sessions_started_today(conn: sqlite3.Connection, profile: str) -> int:
     """Worker runs this profile started since local midnight (runs, not cards)."""
-    lt = time.localtime()
-    midnight = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM task_runs WHERE profile = ? AND started_at >= ?",
-        (profile, midnight),
+        (profile, _local_midnight()),
     ).fetchone()
     return int(row["n"] if row is not None else 0)
 
@@ -2171,7 +2232,24 @@ def _dispatch_lane_task(
     # Daily launch budget for this profile. Checked before the claim so a refusal
     # leaves the retry budget and the card's history untouched; the event says how
     # many it has already started, so the board answers "why is this stuck".
-    session_cap = _max_sessions_per_profile_per_day()
+    # Per-card attempt ceiling first: a card thrashing on its own is invisible to a
+    # lane-wide budget until it has already spent the lane's whole day.
+    attempts_cap = _max_attempts_per_card_per_day()
+    if attempts_cap is not None:
+        attempts = _attempts_today(conn, task_id)
+        if attempts >= attempts_cap:
+            result.skipped_attempts_capped.append((task_id, assignee, attempts))
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    last = conn.execute(
+                        "SELECT kind FROM task_events WHERE task_id = ? "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                    if last is None or last["kind"] != "spawn_refused_attempt_cap":
+                        _kb._append_event(conn, task_id, "spawn_refused_attempt_cap",
+                                          {"profile": assignee, "cap": attempts_cap,
+                                           "attempts_today": attempts})
+            return False
+    session_cap = _max_sessions_per_profile_per_day(assignee)
     if session_cap is not None:
         started = _sessions_started_today(conn, assignee)
         if started >= session_cap:

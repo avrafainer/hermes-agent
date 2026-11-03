@@ -1945,8 +1945,13 @@ DEFAULT_CONFIG = {
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
         # Daily count of worker launches per profile - a spend/"cold start" budget,
-        # not a concurrency cap. None = unlimited (pre-P5.2 behaviour).
+        # not a concurrency cap. Either one int for every profile, or a map from
+        # profile name to int with an optional "default" for the rest. None = unlimited.
         "max_sessions_per_profile_per_day": None,
+        # How many times one card may be launched in a day before dispatch leaves it
+        # alone. Catches a single thrashing card that a lane-wide budget would only
+        # notice by refusing every other card too. None or 0 = no per-card ceiling.
+        "max_attempts_per_card_per_day": 5,
         # Work type -> {"max_runtime_seconds": int, "priority": int}, applied when a
         # card is created with that type. Ships empty on purpose: the numbers are the
         # operator's, and an unconfigured type must leave a card exactly as it was.
