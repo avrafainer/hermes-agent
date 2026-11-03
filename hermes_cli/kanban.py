@@ -21,6 +21,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_cost as kcost
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_output import (
@@ -581,11 +582,21 @@ def _cmd_show(args: argparse.Namespace) -> int:
             elapsed = max(0, r.ended_at - r.started_at) if r.ended_at else None
             el = f"{elapsed}s" if elapsed is not None else "active"
             outcome = r.outcome or r.status or "active"
-            print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  {_fmt_ts(r.started_at)}")
+            run_cost, _calls = kcost.session_cost(getattr(r, "session_id", None))
+            money = f"  {kcost.format_cost(run_cost)}" if run_cost is not None else ""
+            print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  "
+                  f"{_fmt_ts(r.started_at)}{money}")
             if r.summary:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+        total, priced, unpriced = kcost.card_cost(
+            getattr(r, "session_id", None) for r in runs)
+        if total is not None:
+            note = "" if not unpriced else f" ({unpriced} run(s) unattributable)"
+            print(f"  cost: {kcost.format_cost(total)} across {priced} session(s){note}")
+        elif runs:
+            print("  cost: unknown - no run on this card carries a priced session")
     return 0
 
 

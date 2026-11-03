@@ -697,6 +697,9 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # Hermes session of the worker that owned this attempt; None for runs that
+    # predate the column or died before the id could be read.
+    session_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Run:
@@ -710,6 +713,8 @@ class Run:
             **{col: _to_epoch(row[col]) for col in ("claim_expires", "last_heartbeat_at", "ended_at")},
             id=int(row["id"]), started_at=_to_epoch(row["started_at"]) or 0,
             metadata=_json_or(_lossy_text(row["metadata"])),
+            session_id=(_lossy_text(row["session_id"])
+                        if "session_id" in row.keys() else None),
         )
 
 
