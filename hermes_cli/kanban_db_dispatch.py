@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -152,6 +153,9 @@ class DispatchResult:
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    skipped_credits_paused: list[tuple[str, str, int]] = field(default_factory=list)
+    """``(task_id, profile, pause_until)`` left alone because the lane's provider
+    wallet is empty: another spawn would only re-buy the same refusal."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -186,6 +190,9 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["spend_capped"] = counts.get("spend_capped", 0) + len(res.skipped_spend_capped)
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_credits_paused:
+            counts["credits_paused"] = (counts.get("credits_paused", 0)
+                                        + len(res.skipped_credits_paused))
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -1073,6 +1080,8 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    credit_wall: Optional[str] = None
+    """The provider's out-of-money phrasing found in the worker's last output."""
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
@@ -1100,6 +1109,10 @@ def _classify_dead_worker(
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
+            wall = _credit_wall_signature(worker_output)
+            if wall:
+                dead.credit_wall = wall
+                dead.event_payload["credit_wall"] = wall
     return dead
 
 
@@ -1219,6 +1232,17 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+            # A provider wallet that is empty cannot be waited out by retrying: pause
+            # the lane for the configured window, and record ONE event per window
+            # rather than one per dead worker in a fan-out.
+            paused_now = None
+            if dead.credit_wall:
+                paused_now = _pause_lane(row["assignee"], dead.credit_wall,
+                                         _provider_credit_pause_seconds())
+            elif dead.kind != "rate_limited":
+                # This worker reached its provider and got a real answer, so the
+                # wallet is not empty any more: lift any pause on the lane early.
+                _clear_lane_pause(row["assignee"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1237,6 +1261,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+            if paused_now is not None:
+                _kb._append_event(conn, row["id"], "provider_credits_exhausted", {
+                    "profile": row["assignee"],
+                    "signature": dead.credit_wall,
+                    "until": round(paused_now["until"]),
+                    "seconds": paused_now["seconds"],
+                    "pid": pid,
+                }, run_id=run_id)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -2150,6 +2182,113 @@ def _local_midnight() -> int:
     return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
 
 
+# --- Provider wallet wall -------------------------------------------------
+# The only place a provider says "you are out of money" is a dead worker's last
+# output. On 2026-10-30 that sentence was written 369 times in a single hour and
+# dispatch kept spawning: the local spend guard watches Avra's daily ceiling, not
+# an account wallet at OpenRouter. Recognise the sentence, pause the lane, say so
+# once.
+
+_CREDIT_WALL_SIGNATURES: tuple[str, ...] = (
+    "out of credits",
+    "credit limit is exhausted",
+    "insufficient credits",
+    "out of credit",
+    "add credits",
+)
+
+
+def _credit_wall_signature(text: Optional[str]) -> Optional[str]:
+    """The provider's out-of-money phrasing in a worker's last words, if any."""
+    if not text:
+        return None
+    low = text.lower()
+    for sig in _CREDIT_WALL_SIGNATURES:
+        if sig in low:
+            return sig
+    return None
+
+
+def _pauses_path() -> Path:
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return home / "cache" / "dispatch-pauses.json"
+
+
+def _read_pauses() -> dict:
+    try:
+        data = json.loads(_pauses_path().read_text())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_pauses(pauses: dict) -> None:
+    path = _pauses_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(pauses, indent=2, sort_keys=True) + "\n")
+        tmp.replace(path)
+    except OSError:
+        # A lane that cannot record its pause must not crash the tick; the next
+        # dead worker re-detects the wall anyway.
+        pass
+
+
+def _lane_pause(profile: Optional[str]) -> Optional[dict]:
+    """The active pause for a lane, or None (expired entries read as None)."""
+    if not profile:
+        return None
+    entry = _read_pauses().get(profile)
+    if not isinstance(entry, dict):
+        return None
+    try:
+        until = float(entry.get("until", 0))
+    except (TypeError, ValueError):
+        return None
+    return entry if until > time.time() else None
+
+
+def _pause_lane(profile: Optional[str], signature: str, seconds: int) -> Optional[dict]:
+    """Pause a lane. Returns the entry only when the lane was NOT already paused."""
+    if not profile or seconds <= 0:
+        return None
+    already = _lane_pause(profile)
+    pauses = _read_pauses()
+    now = time.time()
+    pauses[profile] = {
+        "until": now + seconds,
+        "since": now,
+        "signature": signature,
+        "seconds": seconds,
+    }
+    _write_pauses(pauses)
+    return None if already else pauses[profile]
+
+
+def _clear_lane_pause(profile: Optional[str]) -> None:
+    """Lift a pause early: a worker on this lane reached its provider and worked."""
+    if not profile:
+        return
+    pauses = _read_pauses()
+    if profile in pauses:
+        pauses.pop(profile, None)
+        _write_pauses(pauses)
+
+
+def _provider_credit_pause_seconds() -> int:
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("provider_credits_pause_seconds")
+    except Exception:
+        return 1800
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 1800
+    return max(0, value)
+
+
 def _attempts_today(conn: sqlite3.Connection, task_id: str) -> int:
     """Launches this one card has had since local midnight."""
     row = conn.execute(
@@ -2229,6 +2368,22 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # Provider wallet wall: when this lane's provider reported the account empty,
+    # nothing on it can succeed until the pause expires — refuse before the claim so
+    # the card keeps its retry budget and the board shows why it is waiting.
+    pause = _lane_pause(assignee)
+    if pause is not None:
+        until = int(pause.get("until", 0))
+        result.skipped_credits_paused.append((task_id, assignee, until))
+        if not dry_run:
+            with _kb.write_txn(conn):
+                last = conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                if last is None or last["kind"] != "spawn_refused_credits_paused":
+                    _kb._append_event(conn, task_id, "spawn_refused_credits_paused",
+                                      {"profile": assignee, "until": until})
+        return False
     # Daily launch budget for this profile. Checked before the claim so a refusal
     # leaves the retry budget and the card's history untouched; the event says how
     # many it has already started, so the board answers "why is this stuck".

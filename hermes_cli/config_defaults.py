@@ -1952,6 +1952,10 @@ DEFAULT_CONFIG = {
         # alone. Catches a single thrashing card that a lane-wide budget would only
         # notice by refusing every other card too. None or 0 = no per-card ceiling.
         "max_attempts_per_card_per_day": 5,
+        # Seconds to stop spawning a lane after its provider reported the account
+        # out of credits. 0 disables the pause. Sized well past a burst: a wallet
+        # refill is a human act, and 369 launches bought the same sentence once.
+        "provider_credits_pause_seconds": 1800,
         # Work type -> {"max_runtime_seconds": int, "priority": int}, applied when a
         # card is created with that type. Ships empty on purpose: the numbers are the
         # operator's, and an unconfigured type must leave a card exactly as it was.

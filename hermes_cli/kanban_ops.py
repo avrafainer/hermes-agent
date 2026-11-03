@@ -57,6 +57,43 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
+def dispatch_payload(res) -> dict:
+    """The `kanban dispatch --json` body, built in one place so it can be tested."""
+    return {
+        **{k: getattr(res, k)
+           for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
+                     "reaped_terminal_workers")},
+        "spawned": [
+            {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
+        ],
+        "skipped_unassigned": res.skipped_unassigned,
+        "skipped_nonspawnable": res.skipped_nonspawnable,
+        "skipped_per_profile_capped": [
+            {"task_id": tid, "assignee": who, "current": current}
+            for (tid, who, current) in res.skipped_per_profile_capped
+        ],
+        "skipped_attempts_capped": [
+            {"task_id": tid, "assignee": who, "attempts_today": attempts}
+            for (tid, who, attempts) in res.skipped_attempts_capped
+        ],
+        "skipped_credits_paused": [
+            {"task_id": tid, "assignee": who, "until": until}
+            for (tid, who, until) in res.skipped_credits_paused
+        ],
+        "skipped_session_capped": [
+            {"task_id": tid, "assignee": who, "sessions_today": started}
+            for (tid, who, started) in res.skipped_session_capped
+        ],
+        "auto_assigned_default": res.auto_assigned_default,
+        "respawn_guarded": [
+            {"task_id": tid, "reason": reason}
+            for (tid, reason) in res.respawn_guarded
+        ],
+        "rate_limited": res.rate_limited,
+        "skipped_locked": res.skipped_locked,
+        "memory_pressure": res.memory_pressure,
+    }
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
@@ -92,36 +129,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
     if getattr(args, "json", False):
-        _print_json({
-            **{k: getattr(res, k)
-               for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
-                         "reaped_terminal_workers")},
-            "spawned": [
-                {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
-            ],
-            "skipped_unassigned": res.skipped_unassigned,
-            "skipped_nonspawnable": res.skipped_nonspawnable,
-            "skipped_per_profile_capped": [
-                {"task_id": tid, "assignee": who, "current": current}
-                for (tid, who, current) in res.skipped_per_profile_capped
-            ],
-            "skipped_attempts_capped": [
-                {"task_id": tid, "assignee": who, "attempts_today": attempts}
-                for (tid, who, attempts) in res.skipped_attempts_capped
-            ],
-            "skipped_session_capped": [
-                {"task_id": tid, "assignee": who, "sessions_today": started}
-                for (tid, who, started) in res.skipped_session_capped
-            ],
-            "auto_assigned_default": res.auto_assigned_default,
-            "respawn_guarded": [
-                {"task_id": tid, "reason": reason}
-                for (tid, reason) in res.respawn_guarded
-            ],
-            "rate_limited": res.rate_limited,
-            "skipped_locked": res.skipped_locked,
-            "memory_pressure": res.memory_pressure,
-        }, ascii=True)
+        _print_json(dispatch_payload(res), ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
     if res.reaped_terminal_workers:
@@ -137,6 +145,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(f"  {', '.join(items)}")
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
+    if res.skipped_credits_paused:
+        until = int(res.skipped_credits_paused[0][2])
+        who = res.skipped_credits_paused[0][1]
+        print(f"Paused:       {len(res.skipped_credits_paused)} card(s) waiting - "
+              f"{who} lane out of provider credits until "
+              f"{time.strftime('%H:%M', time.localtime(until))}")
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
