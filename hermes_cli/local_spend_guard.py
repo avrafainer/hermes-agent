@@ -528,9 +528,18 @@ def snapshot_baseline():
 
 def _required_baseline():
     baseline = read_baseline()
-    if baseline is None:
-        raise BaselineUnavailable("baseline-missing-or-stale")
-    return baseline
+    if baseline is not None:
+        return baseline
+    # Self-heal at the moment of the first paid call after local midnight.  Until
+    # 2026-11-03 this only raised, so a request arriving in the gap between midnight
+    # and the next watchdog tick (every 30 minutes) was refused outright: Avra was
+    # locked out of her own assistant at 00:02.  snapshot_baseline() is idempotent
+    # and still refuses outside the 90 minute window, so the day can never be
+    # back-dated to hide morning spend.
+    healed = snapshot_baseline()
+    if healed is not None:
+        return healed
+    raise BaselineUnavailable("baseline-missing-or-stale")
 
 
 def _key_daily(key):

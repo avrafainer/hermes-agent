@@ -69,12 +69,37 @@ def test_caller_labels_cannot_bypass_without_server_attestation(budget_home):
 def test_unattended_missing_or_stale_baseline_fails_closed_without_network(budget_home, monkeypatch):
     network = mock.Mock(side_effect=AssertionError("network must not run"))
     monkeypatch.setattr(guard, "urlopen", network)
+    # Long past the midnight window, so the self-heal path is not allowed to snapshot.
+    monkeypatch.setattr(guard, "minutes_since_local_midnight", lambda: 600)
     with pytest.raises(guard.SpendGuardBlocked, match="baseline is missing"):
         guard.enforce(provider="openrouter")
     write_baseline(budget_home, date="2026-10-28")
     with pytest.raises(guard.SpendGuardBlocked, match="baseline is missing"):
         guard.enforce(provider="openrouter")
     network.assert_not_called()
+
+
+def test_missing_baseline_heals_on_the_first_paid_call_after_midnight(budget_home, monkeypatch):
+    """A request arriving before the next watchdog tick must not be refused.
+
+    2026-11-03 00:02: the baseline still carried yesterday's date, the 30 minute watchdog
+    had not ticked yet, and Avra was locked out of her own assistant.
+    """
+    monkeypatch.setattr(guard, "minutes_since_local_midnight", lambda: 2)
+    monkeypatch.setattr(guard, "_account_total", lambda: 296.5)
+
+    healed = guard._required_baseline()
+
+    assert healed == {"date": TODAY, "day_start_usage": 296.5}
+    assert json.loads((budget_home / guard.BASELINE_FILE).read_text())["date"] == TODAY
+
+
+def test_self_heal_still_refuses_outside_the_midnight_window(budget_home, monkeypatch):
+    monkeypatch.setattr(guard, "minutes_since_local_midnight", lambda: 600)
+    monkeypatch.setattr(guard, "_account_total", lambda: pytest.fail("account total consulted"))
+
+    with pytest.raises(guard.BaselineUnavailable):
+        guard._required_baseline()
 
 
 @pytest.mark.parametrize("spend,blocked", [(24.99, False), (25.0, True), (25.01, True)])
