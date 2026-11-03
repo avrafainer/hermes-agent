@@ -147,7 +147,8 @@ def test_the_sixth_dispatch_is_refused_and_the_card_says_why(conn, monkeypatch):
     tid = kb.create_task(conn, title="one more job", body="Do the thing.",
                          assignee="builder")
     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: True))
-    monkeypatch.setattr(kbd, "_max_sessions_per_profile_per_day", lambda: 5)
+    monkeypatch.setattr(kbd, "_max_sessions_per_profile_per_day", lambda profile="": 5)
+    monkeypatch.setattr(kbd, "_max_attempts_per_card_per_day", lambda: None)
     # The host's real memory pressure and other boards' workers must not decide
     # this test; both are environmental, and either can short-circuit the tick.
     monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
@@ -177,7 +178,8 @@ def test_under_the_cap_the_same_tick_spawns(conn, monkeypatch):
     tid = kb.create_task(conn, title="fits", body="Do the thing.", assignee="builder",
                          workspace_kind="dir", workspace_path=str(ws))
     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: True))
-    monkeypatch.setattr(kbd, "_max_sessions_per_profile_per_day", lambda: 5)
+    monkeypatch.setattr(kbd, "_max_sessions_per_profile_per_day", lambda profile="": 5)
+    monkeypatch.setattr(kbd, "_max_attempts_per_card_per_day", lambda: None)
     # The host's real memory pressure and other boards' workers must not decide
     # this test; both are environmental, and either can short-circuit the tick.
     monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
