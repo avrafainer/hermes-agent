@@ -947,6 +947,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # NULL, which is honest - those runs' sessions are gone.
     if "session_id" not in _column_names(conn, "task_runs"):
         _add_column_if_missing(conn, "task_runs", "session_id", "session_id TEXT")
+    # tasks.work_type arrived with P5.4: the kind of job decides its cap and
+    # priority at creation. NULL on every pre-existing card, and left that way -
+    # their caps were the caller's choice and are not rewritten behind her back.
+    if "work_type" not in _column_names(conn, "tasks"):
+        _add_column_if_missing(conn, "tasks", "work_type", "work_type TEXT")
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,

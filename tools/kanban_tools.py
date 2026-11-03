@@ -1133,7 +1133,7 @@ def _handle_create(args: dict, **kw) -> str:
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
-            priority=_opt_int(args.get("priority"), 0),
+            priority=_opt_int(args.get("priority")),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
@@ -1145,6 +1145,7 @@ def _handle_create(args: dict, **kw) -> str:
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
+            work_type=args.get("work_type"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)

@@ -82,7 +82,8 @@ _TASK_ID = _arg("task_id")
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
-_PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
+_PRIORITY = _arg("--priority", type=int, default=None,
+                  help="Priority tiebreaker (default 0, or the work type's priority)")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
@@ -181,6 +182,9 @@ _SPECS = [
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
+        _arg("--work-type", dest="work_type",
+             help="Kind of job (e.g. build, research); kanban.work_types fills "
+                  "the cap and priority for that type"),
         _arg("--max-runtime",
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "

@@ -1947,6 +1947,10 @@ DEFAULT_CONFIG = {
         # Daily count of worker launches per profile - a spend/"cold start" budget,
         # not a concurrency cap. None = unlimited (pre-P5.2 behaviour).
         "max_sessions_per_profile_per_day": None,
+        # Work type -> {"max_runtime_seconds": int, "priority": int}, applied when a
+        # card is created with that type. Ships empty on purpose: the numbers are the
+        # operator's, and an unconfigured type must leave a card exactly as it was.
+        "work_types": {},
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a

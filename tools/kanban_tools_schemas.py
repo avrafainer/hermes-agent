@@ -502,6 +502,12 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "open-ended cards where one shot rarely finishes the "
                 "work. Defaults to false (classic single-shot worker)."
         )),
+        "work_type": _prop("string", (
+            "What kind of job this is (e.g. build, research, review). When "
+            "kanban.work_types configures that type, its max_runtime_seconds and "
+            "priority fill any you did not set. Explicit values always win, and an "
+            "unconfigured type changes nothing."
+        )),
         "completion_contract": _prop("string", (
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
