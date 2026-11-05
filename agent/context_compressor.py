@@ -819,8 +819,13 @@ def _next_timeout_cooldown(compressor: Any, counter: str = "_consecutive_timeout
 
 _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
-# Summaries above ~10K tokens are themselves a context-pressure source.
-_SUMMARY_TOKENS_CEILING = 10_000
+# Summaries above ~10K tokens are themselves a context-pressure source, and on the
+# flash-lite aux route a 10K-token ask is not reliably reachable: a 181K-char prompt asking
+# for ~14K tokens returned finish_reason=length after 110s (OpenRouter route: Google AI
+# Studio, nominal cap 65535), which the caller treats as a failed summary and retries on the
+# main model for another ~2 minutes. 4K keeps the ask inside the range the model finishes
+# cleanly, and a summary that is meant to shrink context has no business being 10K tokens.
+_SUMMARY_TOKENS_CEILING = 4_000
 
 # After this many failures at one cursor, skip the exchange to avoid busy-looping.
 _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
@@ -4028,6 +4033,14 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _summary_template_sections(cls, _section: dict[str, str], summary_budget: int, _session_log_section: str) -> str:
         """The ``## ...`` section template shared by the fresh and iterative-update prompts."""
         _temporal_anchoring_rule = cls._temporal_anchoring_rule()
+        _target_tokens = summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)
+        # A token "target" is not a bound. Told to be concrete about a 140K-char log of tool
+        # output, the summariser writes until the provider's output cap and the call returns
+        # finish_reason=length: observed 65K output tokens over 103s, then a full retry on the
+        # main model, which cost another 128s. Words are countable in generation in a way tokens
+        # are not, so the ceiling is stated in words, at 0.6 words-per-token headroom under the
+        # token target, and it is stated as a ceiling rather than as another target.
+        _max_words = max(150, int(_target_tokens * 0.6))
         return f"""{HISTORICAL_TASK_HEADING}
 {_section["historical_task"]}
 
@@ -4080,7 +4093,7 @@ repeat each one verbatim here — copy the exact text, do NOT paraphrase, summar
 or describe them. These markers tell the agent which skills must be reloaded before
 use. If none appear, omit this section entirely.]
 
-Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{_target_tokens} tokens. HARD CEILING: at most {_max_words} words in total, across every section. Stop at the ceiling rather than exceed it — an unfinished final section is better than an overrun. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
