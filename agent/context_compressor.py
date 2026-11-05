@@ -3172,6 +3172,36 @@ class ContextCompressor(
         return min(boundary, len(result) - min_protect)
 
     @staticmethod
+    def _demote_limit_for_summary_budget(
+        result: list[dict[str, Any]], boundary: int, summary_input_budget: int | None,
+    ) -> int:
+        """How many leading messages Pass 2 may demote: 0 when the region already fits, else the
+        oldest results that still have to go for it to fit.
+
+        The region measured is everything before the protected tail, protected head included — the
+        head overstates it slightly, so this can demote a little more than strictly necessary and
+        never less. ``None`` means "no budget": the historical demote-everything-before-the-tail.
+        """
+        if boundary <= 0:
+            return 0
+        if not summary_input_budget or summary_input_budget <= 0:
+            return boundary
+        remaining = 0
+        for msg in result[:boundary]:
+            content = msg.get("content")
+            if isinstance(content, str):
+                remaining += len(content)
+        if remaining <= summary_input_budget:
+            return 0
+        for idx in range(boundary):
+            content = result[idx].get("content")
+            # A demoted body becomes one ~100-char descriptor, so only the excess is reclaimed.
+            remaining -= max(0, (len(content) if isinstance(content, str) else 0) - 100)
+            if remaining <= summary_input_budget:
+                return idx + 1
+        return boundary
+
+    @staticmethod
     def _dedupe_tool_results(result: list[dict[str, Any]]) -> int:
         """Pass 1: keep the newest copy of identical tool results, back-reference older ones."""
         pruned = 0
@@ -3294,10 +3324,18 @@ class ContextCompressor(
     def _prune_old_tool_results(
         self, messages: list[dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None, min_prune_chars: int = _PRUNE_MIN_CHARS,
+        summary_input_budget: int | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Project old tool-result bodies to bounded summaries without rewriting tool-call arguments.
         Returns ``(messages, count)``; token budget (when given) takes priority over the
-        message-count floor."""
+        message-count floor.
+
+        ``summary_input_budget`` (chars) converts this from "demote everything outside the tail" to
+        "demote the oldest of it only until the region the summariser reads fits". Passing None keeps
+        the historical behaviour, which is still what the live-proactive prune wants: there the point
+        is a smaller prompt, not a summariser with room to spare. Without the budget a 600K-char
+        summary window would be handed one-line stubs for 200 tool results it had room to read whole.
+        """
         if not messages:
             return messages, 0
         result = [m.copy() for m in messages]
@@ -3317,9 +3355,19 @@ class ContextCompressor(
         # Pass 2: summarize old tool results. Tool-call arguments are canonical execution
         # records and are never rewritten; summary input is bounded separately by
         # _render_tool_call_for_summary().
+        demote_limit = self._demote_limit_for_summary_budget(result, prune_boundary, summary_input_budget)
+        # A clarify result is reduced to its descriptor whatever the budget says: the raw payload
+        # carries the app's own "use your own judgment and continue" filler when the user never
+        # answered, and a summariser reading that verbatim turns an unanswered question into an
+        # assumed decision. This is a sanitiser, not a size measure.
+        always_demote = {
+            i for i in range(max(0, prune_boundary))
+            if call_id_to_tool.get(result[i].get("tool_call_id", ""), ("", ""))[0] == "clarify"
+        }
         pruned += sum(
             self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills)
             for i in range(max(0, prune_boundary))
+            if i < demote_limit or i in always_demote
         )
         # Pass 3: retire image payloads inside the protected tail; re-sent embeds otherwise make
         # compression look ineffective and trip anti-thrash. Newest frames stay live.
@@ -5553,9 +5601,13 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Unpruned copy for no-op/abort returns (history stays lossless) and finalize; head/tail are
         # assembled and measured from the pruned copy (#61932).
         canonical_messages = self._drop_blank_echoes(messages)
-        # Phase 1: Prune old tool results (cheap, no LLM call)
+        # Phase 1: Prune old tool results (cheap, no LLM call). The budget is what the summariser
+        # can actually read, so a window that fits is summarised from real output instead of stubs.
+        # 97% of the cap leaves room for the per-record rendering the sampler measures ("[USER]: "
+        # prefixes and separators), so a region that fits here is not sampled at the far end.
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n, protect_tail_tokens=self.tail_token_budget,
+            summary_input_budget=int(self._SUMMARY_INPUT_MAX_CHARS * 0.97),
         )
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)

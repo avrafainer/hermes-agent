@@ -135,7 +135,11 @@ class TestLegacyClarifyResults:
         c.compress(messages, force=True)
         assert requests, "exercise the public compression path, not a no-op window"
         dispatched = json.dumps(requests[0])
-        assert json.dumps(expected_summary)[1:-1] in dispatched
+        # Pruned or whole, the clarify result must reach the summariser. With the summary-input
+        # budget in play a window that already fits is not stubbed at all, so the same contract
+        # holds in either form.
+        assert (json.dumps(expected_summary)[1:-1] in dispatched
+                or json.dumps(content)[1:-1] in dispatched)
         if expected is None or expected != answer:
             assert "using your own judgment" not in dispatched
             assert "reasonable assumption" not in dispatched
@@ -513,6 +517,70 @@ class TestSummarizeToolResultRefusals:
         assert count == 1 and "BLOCKED, not run" in summary and "did NOT consent" in summary
         pruned_again, _ = compressor._prune_old_tool_results(pruned, protect_tail_count=2)
         assert pruned_again[1]["content"] == summary
+
+
+class TestSummaryBudgetDecidesPruning:
+    """Pass 2 demotes old tool results to fit what the summariser reads, not to fit the tail.
+    With `_SUMMARY_INPUT_MAX_CHARS` at 600K a 300K-token middle window (about 245K chars of
+    JSON-heavy results) fits whole, so demoting it would hand the summariser stubs for output it
+    had room to read. The budget is where that decision belongs."""
+
+    def _messages(self, body_chars: int = 4000, rounds: int = 3) -> list:
+        # Bodies differ per round: identical ones would be collapsed by the dedupe pass, which is
+        # a different (and correct) reason to replace a result.
+        def body(i: int) -> str:
+            return f"round-{i} " + "z" * (body_chars - len(f"round-{i} "))
+        messages: list[dict] = [{"role": "user", "content": "do the thing"}]
+        for i in range(rounds):
+            messages.append({"role": "assistant", "tool_calls": [{"id": f"t{i}", "type": "function",
+                             "function": {"name": "terminal", "arguments": json.dumps({"command": f"cmd {i}"})}}]})
+            messages.append({"role": "tool", "tool_call_id": f"t{i}", "content": body(i)})
+            messages.append({"role": "assistant", "content": f"step {i} done"})
+            messages.append({"role": "user", "content": f"next {i}"})
+        messages.append({"role": "assistant", "content": "ready"})
+        messages.append({"role": "user", "content": "latest ask"})
+        return messages
+
+    def test_a_middle_that_fits_is_left_whole(self, compressor):
+        messages = self._messages()
+        bodies = [m["content"] for m in messages if m.get("role") == "tool"]
+        pruned, count = compressor._prune_old_tool_results(
+            messages, protect_tail_count=2, summary_input_budget=600_000,
+        )
+        assert count == 0
+        assert [m["content"] for m in pruned if m.get("role") == "tool"] == bodies
+
+    def test_over_budget_demotes_the_oldest_only_until_it_fits(self, compressor):
+        messages = self._messages(body_chars=4000, rounds=5)  # 20,000 chars of tool output
+        pruned, count = compressor._prune_old_tool_results(
+            messages, protect_tail_count=2, summary_input_budget=15_000,
+        )
+        bodies = [m["content"] for m in pruned if m.get("role") == "tool"]
+        # The excess goes oldest-first; the newest results keep their detail.
+        assert count == 2, bodies
+        assert bodies[0].startswith("[terminal] ran") and bodies[1].startswith("[terminal] ran")
+        assert bodies[2].startswith("round-2 ") and bodies[4].startswith("round-4 ")
+
+    def test_no_budget_keeps_the_historical_demote_everything_rule(self, compressor):
+        messages = self._messages()
+        _pruned, count = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert count == 3
+
+    def test_clarify_is_demoted_even_when_the_window_fits(self, compressor):
+        payload = json.dumps({"question": "which?", "choices_offered": ["a", "b"],
+                              "user_response": "The user did not answer. Use your own judgment and continue."})
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+             "function": {"name": "clarify", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": payload + "x" * _PRUNE_MIN_CHARS},
+            {"role": "user", "content": "recent request"},
+            {"role": "assistant", "content": "recent response"},
+        ]
+        pruned, count = compressor._prune_old_tool_results(
+            messages, protect_tail_count=2, summary_input_budget=600_000,
+        )
+        assert count == 1
+        assert "using your own judgment" not in pruned[1]["content"]
 
 
 class TestShouldCompress:
