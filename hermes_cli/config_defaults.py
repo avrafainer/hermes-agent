@@ -708,6 +708,15 @@ DEFAULT_CONFIG = {
         # already at/below threshold × target_ratio; honors the same cooldown/ anti-thrash/lock
         # guards. Example: 1800 = 30 min.
         "idle_compact_after_seconds": 0,
+        # post_turn_compact: opt-in. Run the full summary pass AFTER the reply has been delivered,
+        # once context passes post_turn_compact_ratio of the threshold, instead of in front of the
+        # next request. Same compressor path, same lock, same transcript rule; only the moment moves.
+        # The measured cost is the summary call alone (12.6s on a fast summariser, 67s when the
+        # primary rate-limits and the chain takes over), so this is the only lever that removes the
+        # wait rather than shortening it.
+        "post_turn_compact": False,
+        # Fraction of threshold_tokens that arms it (0.1-0.99; 0.75 = 225K on a 300K threshold).
+        "post_turn_compact_ratio": 0.75,
     },
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "5m" | "1h" | "auto"
     # (auto = 1h for human-paced sessions — cli/tui/desktop/messaging — and 5m for subagent, cron,

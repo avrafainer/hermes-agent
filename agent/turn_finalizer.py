@@ -328,6 +328,67 @@ def _micro_compact_after_turn(agent, messages, final_response, logger, task_id) 
         logger.info("Micro-compaction failed: %s", _mc_err)
 
 
+def _post_turn_compaction(agent, messages, logger, task_id) -> None:
+    """Compact *after* the reply has been delivered, instead of in front of the next request.
+
+    Every compaction today fires inside work the user is waiting on: 48 of the 62 attempts logged
+    up to 2026-11-05 were ``post_tool``, 13 were ``turn_start_threshold``, one manual, none idle.
+    The summary call itself is the whole cost (12.6s on a fast summariser, 67s when the primary
+    rate-limits and the chain takes over), so the only way to make it cheap for her is to move the
+    moment. This runs inside the turn's lease and through ``_compress_context``, the same path the
+    mid-turn trigger uses, so locking, telemetry, persistence and the transcript rule are unchanged.
+
+    Opt-in and fail-closed: disabled by default, and below-watermark / awaiting-real-usage /
+    persistence-isolated all mean no work here, with the normal trigger still handling the thread.
+    """
+    try:
+        # Strict `is True`: plugin context engines and MagicMock agents pass duck checks.
+        if getattr(agent, "compression_post_turn_compact", False) is not True:
+            return
+        if not getattr(agent, "compression_enabled", False):
+            return
+        if getattr(agent, "_persist_disabled", False):
+            return
+        _compressor = getattr(agent, "context_compressor", None)
+        if _compressor is None or not callable(getattr(agent, "_compress_context", None)):
+            return
+        _ratio = getattr(agent, "compression_post_turn_compact_ratio", 0)
+        threshold = getattr(_compressor, "threshold_tokens", 0)
+        if not isinstance(_ratio, (int, float)) or isinstance(_ratio, bool) or _ratio <= 0:
+            return
+        if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold <= 0:
+            return
+        watermark = int(threshold * float(_ratio))
+        # A native checkpoint must reach its issuer once before local compression decides again
+        # (the same latch the idle and post-tool paths honour).
+        if bool(getattr(_compressor, "awaiting_real_usage_after_compression", False)):
+            return
+        from agent import turn_context as _tc
+
+        tokens = _tc._preflight_request_tokens(
+            agent, messages, getattr(agent, "active_system_prompt", "") or ""
+        )
+        if tokens < watermark:
+            return
+        logger.info(
+            "Post-turn compaction: ~%s tokens >= %s watermark (threshold %s) after the reply",
+            f"{tokens:,}", f"{watermark:,}", f"{threshold:,}",
+        )
+        before = len(messages)
+        compacted, _ = agent._compress_context(
+            messages, None, approx_tokens=tokens, task_id=task_id, trigger="post_turn",
+        )
+        if isinstance(compacted, list) and compacted is not messages:
+            messages[:] = compacted
+            from agent.conversation_compression import _reset_read_dedup_caches
+
+            _reset_read_dedup_caches(task_id, session_id=getattr(agent, "session_id", "") or "")
+        if before != len(messages):
+            logger.info("Post-turn compaction: %d -> %d messages", before, len(messages))
+    except Exception as ptc_err:
+        logger.info("Post-turn compaction skipped: %s", ptc_err)
+
+
 def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger) -> None:
     """Always INFO so agent.log captures WHY every turn ended; WARNING when the last
     message is a tool result (the "just stops" scenario)."""
@@ -632,6 +693,9 @@ def finalize_turn(
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
+            # The reply is already in front of her; the expensive summary call belongs here, not
+            # in front of her next request. Opt-in (compression.post_turn_compact).
+            _post_turn_compaction(agent, messages, logger, effective_task_id)
         agent._persist_session(messages, conversation_history)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
