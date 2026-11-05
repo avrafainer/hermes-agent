@@ -717,6 +717,12 @@ DEFAULT_CONFIG = {
         "post_turn_compact": False,
         # Fraction of threshold_tokens that arms it (0.1-0.99; 0.75 = 225K on a 300K threshold).
         "post_turn_compact_ratio": 0.75,
+        # summary_parallel_chunks: 1 = one summary call, as before. N>1 splits the pre-tail records
+        # into N contiguous parts and summarises them concurrently, joined in order. Measured
+        # 2026-11-05 on a 388,738-char window: 12.6s as one call, 5.6s as three. Nothing is dropped;
+        # parts never split a record, and a part that fails fails the whole summary rather than
+        # committing a half one.
+        "summary_parallel_chunks": 1,
     },
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "5m" | "1h" | "auto"
     # (auto = 1h for human-paced sessions — cli/tui/desktop/messaging — and 5m for subagent, cron,

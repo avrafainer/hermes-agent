@@ -1608,6 +1608,7 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         idle_compact_after_seconds=idle_compact_after_seconds,
         post_turn_compact=post_turn_compact,
         post_turn_compact_ratio=post_turn_compact_ratio,
+        summary_parallel_chunks=max(1, min(6, _parse_config_int(cfg.get("summary_parallel_chunks", 1), 1))),
     )
 
 
@@ -2045,6 +2046,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         ("_micro_compact_enabled", cs.micro_compact),
         ("_micro_compact_every_n_turns", cs.micro_compact_every_n_turns),
         ("_micro_compact_defrag_threshold_tokens", cs.micro_compact_defrag_tokens),
+        ("_summary_parallel_chunks", cs.summary_parallel_chunks),
     ):
         if hasattr(_cc, _attr):
             setattr(_cc, _attr, _value)

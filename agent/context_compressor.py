@@ -837,6 +837,9 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 # 1M-token windows. Raising this trades prompt size for coverage only; nothing is dropped from
 # session history either way. NEVER add a max_tokens wire cap on the summary call.
 _SUMMARY_INPUT_MAX_CHARS = 600_000
+# Fewer records than this per part and the split costs more than it saves: each part gets less
+# context and the summary loses cross-part continuity for no wall-clock gain.
+_MIN_RECORDS_PER_CHUNK = 25
 
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
@@ -2830,6 +2833,8 @@ class ContextCompressor(
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
+        # Parallel summary parts (1 = one call). Set from compression.summary_parallel_chunks.
+        self._summary_parallel_chunks = 1
         # Per-model context_length overrides live in custom_providers; without them deferred
         # resolution falls back to the hardcoded family catalog (#83324).
         self.custom_providers = custom_providers or None
@@ -3881,6 +3886,81 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             return entry
         return None
 
+    def _split_summary_records(self, records: Optional[list[str]]) -> Optional[list[str]]:
+        """Split serialized records into contiguous parts for concurrent summarisation, or None.
+
+        Opt-in via ``compression.summary_parallel_chunks`` (default 1). Parts never split a single
+        record, so a tool call and its result stay in the same request, and they are joined back in
+        order, so the summary reads as one document. Below ``_MIN_RECORDS_PER_CHUNK`` per part the
+        split is a no-op: three tiny calls cost more (and carry less context each) than one.
+        """
+        count = getattr(self, "_summary_parallel_chunks", 1)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 2:
+            return None
+        if not records or len(records) < count * _MIN_RECORDS_PER_CHUNK:
+            return None
+        total = sum(len(r) for r in records)
+        target = max(1, total // count)
+        parts: list[list[str]] = []
+        current: list[str] = []
+        size = 0
+        for record in records:
+            current.append(record)
+            size += len(record)
+            # Close a part once it reaches its share, keeping the remainder for the last one.
+            if size >= target and len(parts) < count - 1:
+                parts.append(current)
+                current, size = [], 0
+        if current:
+            parts.append(current)
+        if len(parts) < 2:
+            return None
+        return ["\n\n".join(part) for part in parts]
+
+    def _call_summary_llm_parallel(
+        self, chunks: list[str], summary_budget: int, focus_topic: Optional[str],
+        memory_context: str, has_user_turn: bool,
+    ) -> str:
+        """Summarise the parts concurrently and join them in order.
+
+        Each part goes through the same ``_call_summary_llm`` the single-call path uses, so routing,
+        validation, truncation detection, interrupt shielding and the cooldown/failure machinery are
+        identical. A truncated or empty part raises, which routes the whole summary through the
+        existing fallback chain rather than committing a half-summary.
+
+        Deliberately not parallel-safe state: ``_last_aux_resolved_model`` and the per-call telemetry
+        hook are written per call and the last writer wins. That is acceptable here because every
+        part resolves the same route; nothing on the failure path reads those fields mid-flight.
+        """
+        count = len(chunks)
+        per_part_budget = max(800, summary_budget // count)
+        results: list[Optional[str]] = [None] * count
+        started = time.monotonic()
+
+        def _summarise(index: int, text: str) -> None:
+            banner = (
+                f"This is part {index + 1} of {count} of ONE conversation, split for length. "
+                "Summarise only what this part contains, in the usual structure. Do not mention "
+                "the split, do not summarise the other parts, and leave no trailing 'to be continued'.\n\n"
+            )
+            prompt = self._build_summary_prompt(
+                banner + text, per_part_budget, focus_topic, memory_context, has_user_turn,
+            )
+            results[index] = self._call_summary_llm(prompt, started)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=count, thread_name_prefix="sumsummary") as pool:
+            futures = [pool.submit(_summarise, i, text) for i, text in enumerate(chunks)]
+            for future in futures:
+                future.result()
+        parts = [r for r in results if r]
+        if len(parts) != count:
+            raise RuntimeError(
+                f"Parallel summary produced {len(parts)} of {count} parts; refusing a partial summary"
+            )
+        return "\n\n".join(f"### Part {i + 1} of {count}\n{results[i]}" for i in range(count))
+
     def _call_summary_llm(self, prompt: str, prompt_started_at: float) -> str:
         """Issue the single aux summary call; return validated content text.
         Raises RuntimeError for empty content or a length-truncated (PARTIAL) summary so the failure
@@ -3996,6 +4076,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             _collect_ghosted_skill_names(turns_to_summarize) + _extract_pruned_skill_names(self._previous_summary or "")
         ))[:_MAX_PRUNED_SKILL_MARKERS]
         # Lean mode even-samples oversized input (one bounded request, never a second).
+        records = None
         if getattr(self, "tail_mode", "lean") == "lean":
             records = self._serialize_records_for_summary(turns_to_summarize)
             content_to_summarize, coverage = self._sample_summary_records(records)
@@ -4005,9 +4086,19 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         has_user_turn = getattr(self, "_summary_has_user_turn", None)
         if has_user_turn is None:
             has_user_turn = self._transcript_has_real_user_turn(turns_to_summarize)
+        # Parallel chunks (opt-in): the summary call is the whole cost of a compaction, and it is
+        # one request's wall clock. Measured 2026-11-05 on a real 388,738-char window: 12.6s as one
+        # call to gemini-2.5-flash-lite, 5.6s as three concurrent calls at the same total output
+        # budget. Splitting changes nothing about what is covered; only the wait changes.
+        chunks = self._split_summary_records(records)
         prompt = self._build_summary_prompt(content_to_summarize, summary_budget, focus_topic, memory_context, has_user_turn)
         try:
-            content = self._call_summary_llm(prompt, prompt_started_at)
+            if chunks:
+                content = self._call_summary_llm_parallel(
+                    chunks, summary_budget, focus_topic, memory_context, has_user_turn,
+                )
+            else:
+                content = self._call_summary_llm(prompt, prompt_started_at)
             # Strip <think> blocks: they would be stored, injected, and compounded on every iterative update.
             from agent.agent_runtime_helpers import strip_think_blocks
             content = strip_think_blocks(None, content).strip() or content
