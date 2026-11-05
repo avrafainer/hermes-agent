@@ -830,9 +830,13 @@ _SUMMARY_TOKENS_CEILING = 4_000
 # After this many failures at one cursor, skip the exchange to avoid busy-looping.
 _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 
-# Prompt-side char cap on the serialized turn block (~40K tokens; head+tail kept,
-# see _bound_summary_input). NEVER add a max_tokens wire cap on the summary call.
-_SUMMARY_INPUT_MAX_CHARS = 160_000
+# Prompt-side char cap on the serialized turn block (head+tail kept, see _bound_summary_input).
+# 600,000 chars covers a full middle window at a 300K threshold (measured: ~245,000 chars for a
+# 185K-token window, JSON-heavy tool results run ~1.3 chars per token), so the summariser is no
+# longer handed a sample and told nothing about the rest. It stays far inside the aux models'
+# 1M-token windows. Raising this trades prompt size for coverage only; nothing is dropped from
+# session history either way. NEVER add a max_tokens wire cap on the summary call.
+_SUMMARY_INPUT_MAX_CHARS = 600_000
 
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
@@ -3624,7 +3628,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         tail = content[-tail_chars:].lstrip() if tail_chars else ""
         return content[:head_chars].rstrip() + marker + tail
 
-    # Lean-mode sampling slice count: 8 keeps slices ~20K chars at the 160K cap.
+    # Lean-mode sampling slice count: 8 keeps each slice whole-record-dense at the char cap above
+    # (roughly 75K chars per slice at 600K, 20K at the old 160K).
     _SAMPLED_INPUT_SLICES = 8
 
     @classmethod
@@ -3799,6 +3804,40 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _configured_summary_fallback(self, failed_model: str) -> Optional[dict[str, Any]]:
+        """First untried ``auxiliary.compression.fallback_chain`` entry that can be used here, or None.
+
+        A truncated, stalled or empty summary is a capacity failure on the summariser, not an outage of
+        its provider, so the per-task chain is the right next stop before the main model. Replaying the
+        same oversized prompt on the main model is what turned a 30s summary into 142s and 268s in one
+        session. Only entries naming no provider, or the provider already in use, are eligible: the
+        credential in hand belongs to that provider and must not be sent to another host.
+        """
+        try:
+            from agent.auxiliary_client import _get_auxiliary_task_config
+            chain = _get_auxiliary_task_config("compression").get("fallback_chain") or []
+        except Exception:
+            return None
+        if not isinstance(chain, list):
+            return None
+        tried = getattr(self, "_summary_fallback_tried", None)
+        if not isinstance(tried, set):
+            tried = self._summary_fallback_tried = set()
+        tried.add(failed_model)
+        in_use = str(getattr(self, "provider", "") or "").strip().lower()
+        for entry in chain:
+            if not isinstance(entry, dict):
+                continue
+            model = str(entry.get("model") or "").strip()
+            entry_provider = str(entry.get("provider") or "").strip().lower()
+            if not model or model in tried or model == self.model:
+                continue
+            if entry_provider and in_use and entry_provider != in_use:
+                continue
+            tried.add(model)
+            return entry
+        return None
+
     def _call_summary_llm(self, prompt: str, prompt_started_at: float) -> str:
         """Issue the single aux summary call; return validated content text.
         Raises RuntimeError for empty content or a length-truncated (PARTIAL) summary so the failure
@@ -3948,6 +3987,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
             self._summary_model_fallen_back = False
+            self._summary_fallback_tried = set()
             self._last_summary_error = None
             self._clear_terminal_summary_failures()
             # The provider answered a summary again: the sustained-overload budget restarts (#123167).
@@ -4145,6 +4185,22 @@ Write only the summary body. Do not include any preamble or prefix."""
             self.summary_model or getattr(self, "_last_aux_resolved_model", "") or ""
         ).strip()
         if _route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
+            # The configured per-task chain gets the failed summary before the main model does: a
+            # capacity failure on a flash-class summariser belongs on the next summariser, not on a
+            # replay that costs minutes. Only when the chain is absent or exhausted does the main
+            # model take it.
+            _chain_entry = self._configured_summary_fallback(_route_model)
+            if _chain_entry is not None:
+                logger.warning(
+                    "Summary model '%s' %s (%s). Retrying on the configured compression fallback '%s'.",
+                    _route_model, kind.fallback_reason(), e, _chain_entry.get("model"),
+                )
+                telemetry = getattr(self, "_active_compression_telemetry", None)
+                if isinstance(telemetry, dict):
+                    telemetry["summary_fallback_model"] = _chain_entry.get("model")
+                self.summary_model = str(_chain_entry.get("model") or "")
+                self._clear_compression_failure_cooldown()
+                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
             self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
             # Retry immediately on the main model.
             return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)

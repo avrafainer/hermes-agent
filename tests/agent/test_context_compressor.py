@@ -1562,6 +1562,101 @@ class TestStreamingClosedFailure:
         assert self._fail_on_main(err)._last_summary_network_failure is True
 
 
+class TestConfiguredCompressionFallbackChain:
+    """A capacity failure on the summariser (truncated, stalled, empty) belongs on the next
+    summariser the user configured, not on a replay of the same oversized prompt on the main model.
+    Measured on 2026-11-05: 30s on a flash-class summariser against 142s and 268s on the main model
+    for the identical compaction."""
+
+    def _msgs(self):
+        return [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+    def _ok(self, text):
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = text
+        return mock_ok
+
+    def _err(self):
+        err = Exception("404 model_not_found: no such model")
+        setattr(err, "status_code", 404)
+        return err
+
+    def _compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="main-model",
+                summary_model_override="broken-aux-model",
+                quiet_mode=True,
+            )
+
+    def test_configured_chain_is_tried_before_the_main_model(self):
+        c = self._compressor()
+        chain = [{"provider": "openrouter", "model": "backup-summariser"}]
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": chain}), patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._err(), self._ok("summary via configured chain")],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
+        assert mock_call.call_args_list[1].kwargs.get("model") == "backup-summariser"
+        assert result is not None and "summary via configured chain" in result
+        # Never treated as a main-model fallback: the chain absorbed it.
+        assert c._summary_model_fallen_back is False
+
+    def test_exhausted_chain_still_falls_back_to_the_main_model(self):
+        c = self._compressor()
+        chain = [{"provider": "openrouter", "model": "backup-summariser"}]
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": chain}), patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._err(), self._err(), self._ok("summary via main model")],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 3
+        assert [call.kwargs.get("model") for call in mock_call.call_args_list] == [
+            "broken-aux-model",
+            "backup-summariser",
+            "main-model",
+        ]
+        assert result is not None and "summary via main model" in result
+        # The main-model hop happened, and it names the model that actually failed last.
+        assert c._last_aux_model_failure_model == "backup-summariser"
+
+    def test_no_chain_keeps_the_old_single_hop_to_main(self):
+        c = self._compressor()
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={}), patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._err(), self._ok("summary via main model")],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
+        assert result is not None and "summary via main model" in result
+
+    def test_a_chain_entry_for_another_provider_is_skipped(self):
+        """The credential in hand belongs to the provider already in use; it must not be sent
+        to a different host on the strength of a config entry."""
+        c = self._compressor()
+        c.provider = "openrouter"
+        chain = [{"provider": "anthropic", "model": "claude-somewhere-else"}]
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": chain}), patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._err(), self._ok("summary via main model")],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
+        assert result is not None
+
+
 class TestAuxModelFallbackSurfacedToCallers:
     """When summary_model fails but retry-on-main succeeds, compress() must
     expose the aux-model failure via _last_aux_model_failure_{model,error}
@@ -3308,7 +3403,10 @@ class TestSummaryPromptBounding:
         one run joined by the record separator — no zero-width elision marker, no missing
         separator — and the coverage telemetry still counts each shown record once."""
         cap = ContextCompressor._SUMMARY_INPUT_MAX_CHARS
-        records = [f"[USER]: record-{i:02d} " + ("x" * 8500) for i in range(20)]
+        # Record size is derived from the cap, not hardcoded: one record ~= 1/20 of the cap keeps
+        # the slice geometry (8 slices, ~2.4 records each) identical whatever the cap becomes.
+        per_record = cap // 20 + 1000
+        records = [f"[USER]: record-{i:02d} " + ("x" * per_record) for i in range(20)]
         assert sum(map(len, records)) > cap  # sampling engages, with headroom > one gap
         sampled, coverage = ContextCompressor._sample_summary_records(records)
         assert len(sampled) <= cap
