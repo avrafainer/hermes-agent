@@ -3171,35 +3171,20 @@ class ContextCompressor(
         # Apply the floor in count-space: `max` in index-space would invert (smaller index = MORE protected).
         return min(boundary, len(result) - min_protect)
 
-    @staticmethod
-    def _demote_limit_for_summary_budget(
-        result: list[dict[str, Any]], boundary: int, summary_input_budget: int | None,
-    ) -> int:
-        """How many leading messages Pass 2 may demote: 0 when the region already fits, else the
-        oldest results that still have to go for it to fit.
+    def _rendered_record_chars(self, msg: dict[str, Any]) -> int:
+        """Length of one serialized summary record, as the sampler measures it."""
+        return sum(len(r) for r in self._serialize_records_for_summary([msg]))
 
-        The region measured is everything before the protected tail, protected head included — the
-        head overstates it slightly, so this can demote a little more than strictly necessary and
-        never less. ``None`` means "no budget": the historical demote-everything-before-the-tail.
+    def _rendered_region_chars(self, result: list[dict[str, Any]], boundary: int) -> int:
+        """Length of the whole pre-tail region as the summariser will receive it.
+
+        Measured through ``_serialize_records_for_summary`` rather than raw content lengths: that
+        serializer clamps each message, redacts, and renders tool calls, so the only number that
+        predicts whether the sampler will elide anything is the one it produces.
         """
         if boundary <= 0:
             return 0
-        if not summary_input_budget or summary_input_budget <= 0:
-            return boundary
-        remaining = 0
-        for msg in result[:boundary]:
-            content = msg.get("content")
-            if isinstance(content, str):
-                remaining += len(content)
-        if remaining <= summary_input_budget:
-            return 0
-        for idx in range(boundary):
-            content = result[idx].get("content")
-            # A demoted body becomes one ~100-char descriptor, so only the excess is reclaimed.
-            remaining -= max(0, (len(content) if isinstance(content, str) else 0) - 100)
-            if remaining <= summary_input_budget:
-                return idx + 1
-        return boundary
+        return sum(len(r) for r in self._serialize_records_for_summary(result[:boundary]))
 
     @staticmethod
     def _dedupe_tool_results(result: list[dict[str, Any]]) -> int:
@@ -3355,20 +3340,30 @@ class ContextCompressor(
         # Pass 2: summarize old tool results. Tool-call arguments are canonical execution
         # records and are never rewritten; summary input is bounded separately by
         # _render_tool_call_for_summary().
-        demote_limit = self._demote_limit_for_summary_budget(result, prune_boundary, summary_input_budget)
-        # A clarify result is reduced to its descriptor whatever the budget says: the raw payload
-        # carries the app's own "use your own judgment and continue" filler when the user never
-        # answered, and a summariser reading that verbatim turns an unanswered question into an
-        # assumed decision. This is a sanitiser, not a size measure.
+        #
+        # Two reasons to demote, and they are different questions. With a summary-input budget the
+        # question is "does the summariser still fit this in", measured with the SAME serializer the
+        # summary input is built from, so a region reported as fitting is a region the sampler will
+        # not elide. Without a budget the historical rule stands: everything before the tail.
+        # Separately, a clarify result is always reduced to its descriptor: the raw payload carries
+        # the app's own "use your own judgment and continue" filler when nobody answered, and a
+        # summariser reading it verbatim turns an unanswered question into an assumed decision.
+        budgeted = bool(summary_input_budget and summary_input_budget > 0)
+        budget = int(summary_input_budget or 0)
         always_demote = {
             i for i in range(max(0, prune_boundary))
             if call_id_to_tool.get(result[i].get("tool_call_id", ""), ("", ""))[0] == "clarify"
         }
-        pruned += sum(
-            self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills)
-            for i in range(max(0, prune_boundary))
-            if i < demote_limit or i in always_demote
-        )
+        region_chars = self._rendered_region_chars(result, prune_boundary) if budgeted else 0
+        for i in range(max(0, prune_boundary)):
+            if budgeted and i not in always_demote and region_chars <= budget:
+                # The rest of the region fits as it is; nothing else needs demoting for size.
+                continue
+            before = self._rendered_record_chars(result[i]) if budgeted else 0
+            if self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills):
+                pruned += 1
+                if budgeted:
+                    region_chars += self._rendered_record_chars(result[i]) - before
         # Pass 3: retire image payloads inside the protected tail; re-sent embeds otherwise make
         # compression look ineffective and trip anti-thrash. Newest frames stay live.
         # Newest frames stay live for follow-up QA; unread spared results stay live too. See #92699.
