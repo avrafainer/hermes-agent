@@ -891,6 +891,17 @@ def handle_function_call(
         function_args = {}
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
+    # Thread-scoped whitelist (the background-review fork) is enforced here as well as in the
+    # pre_tool_call hook: registry tools reach dispatch with skip_pre_tool_call_hook=True, so a
+    # fork whitelisted to skill/memory tools could otherwise still run execute_code or terminal.
+    try:
+        from hermes_cli.plugins import thread_tool_denial
+
+        _denial = thread_tool_denial(function_name)
+    except Exception:  # pragma: no cover - plugins module always importable in practice
+        _denial = None
+    if _denial is not None:
+        return json.dumps({"error": _denial, "denied_by": "thread_tool_whitelist"})
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
     start = time.monotonic()
 

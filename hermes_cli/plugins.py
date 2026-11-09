@@ -1938,6 +1938,21 @@ def clear_thread_tool_whitelist() -> None:
     _thread_tool_whitelist.allowed = None
 
 
+def thread_tool_denial(tool_name: str) -> Optional[str]:
+    """Deny message when this thread's whitelist excludes *tool_name*, else None.
+
+    Dispatch-side enforcement for callers that never reach the pre_tool_call hook
+    (``agent/tool_executor.py`` executes registry tools with
+    ``skip_pre_tool_call_hook=True``). Without this, a whitelisted fork -- the background
+    review, which allows skill and memory tools only -- could still run execute_code.
+    """
+    allowed = getattr(_thread_tool_whitelist, "allowed", None)
+    if allowed is None or tool_name in allowed:
+        return None
+    fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
+    return fmt.format(tool_name=tool_name)
+
+
 def _get_pre_tool_call_directive_details(
     tool_name: str, args: Optional[dict[str, Any]], task_id: str = "", session_id: str = "",
     tool_call_id: str = "", turn_id: str = "", api_request_id: str = "",
