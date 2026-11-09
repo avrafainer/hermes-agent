@@ -380,11 +380,26 @@ _MEMORY_ROUTING_BLOCK = (
     "target, that store is the only one enabled — use it and skip the other.\n\n"
 )
 
+
+# Closes the loop that the correction ledger opens. The recurring failure is not a slip in
+# one turn: it is a check that never existed. Asking this of every review turns "she had to
+# point it out" into a candidate rule instead of a memory of being told off.
+_INTROSPECTION_BLOCK = (
+    "Before you finish, answer one question in your own reasoning: **what did the user have to "
+    "point out that was already inferable from the record, the files, or the tools?** Each such "
+    "item is a missing CHECK, not a one-off slip — she should not have needed the sentence. If "
+    "you find one, save at most one memory entry naming the CLASS and the check that would catch "
+    "it (for example: 'a corpus can be counted in an inventory and still produce no rows in the "
+    "layer the work reads; verify reachability, not counts'). Save the rule, never a narration "
+    "of the incident, and never a summary of the conversation.\n\n"
+)
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
     "Memory has " + _MEMORY_ROUTING_BLOCK +
     "If something stands out, save it once, in the right store, using the memory tool with the "
-    "matching target. If nothing is worth saving, just say 'Nothing to save.' and stop."
+    "matching target. If nothing is worth saving, just say 'Nothing to save.' and stop.\n\n" +
+    _INTROSPECTION_BLOCK
 )
 
 # Shared shape contract for anything written into a skill. The failure mode this prevents is the
@@ -521,7 +536,7 @@ _COMBINED_REVIEW_PROMPT = (
     "**Memory**: " + _MEMORY_ROUTING_BLOCK +
     "**Skills**: how to do this class of task. Be ACTIVE — most sessions produce at least one "
     "skill update. A pass that does nothing is a missed learning opportunity, not a neutral "
-    "outcome.\n\n"
+    "outcome.\n\n" + _INTROSPECTION_BLOCK +
     "Target shape of the skill library: CLASS-LEVEL skills with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth — not narrow one-session skills, and not an umbrella "
     "hoarding a references/ file per session.\n\n" + _LESSON_LAYER_BLOCK +
