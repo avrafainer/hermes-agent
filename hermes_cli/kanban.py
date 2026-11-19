@@ -21,6 +21,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_cost as kcost
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_output import (
@@ -345,6 +346,25 @@ def _cmd_create(args: argparse.Namespace) -> int:
         except OSError as exc:
             return _err(f"kanban: --body-file: {exc}", 2)
 
+    # Cost gate at the CLI boundary. new_card.py checks this too, but this command
+    # is the documented way to bypass that wrapper, and on 2026-10-31 a card created
+    # here ran a $18 read against a $5.45 projection. A card that sends a worker into
+    # corpus files must declare a measured cost; new_card.py only writes that line
+    # after cost_gate.py has checked it against measured samples.
+    if body and "Declared cost:" not in body:
+        _bulk_markers = (
+            "ledger/corpus", "archive-sources/", "read in chunks",
+            "per conversation", "corpus-export", "chatgpt-export",
+        )
+        if any(m in body for m in _bulk_markers) and os.environ.get("HERMES_ALLOW_UNCOSTED") != "1":
+            return _err(
+                "kanban: refused: this card reads corpus files in bulk but declares no "
+                "measured cost.\n"
+                "  Use ~/.hermes/scripts/new_card.py --cost-mb <MB> --cost-files <n> "
+                "--cost-review yes|no so a measured rate and a ceiling apply.\n"
+                "  To override deliberately: HERMES_ALLOW_UNCOSTED=1 hermes kanban create ...",
+                4)
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -374,6 +394,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
+            work_type=getattr(args, "work_type", None),
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
@@ -562,11 +583,21 @@ def _cmd_show(args: argparse.Namespace) -> int:
             elapsed = max(0, r.ended_at - r.started_at) if r.ended_at else None
             el = f"{elapsed}s" if elapsed is not None else "active"
             outcome = r.outcome or r.status or "active"
-            print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  {_fmt_ts(r.started_at)}")
+            run_cost, _calls = kcost.session_cost(getattr(r, "session_id", None))
+            money = f"  {kcost.format_cost(run_cost)}" if run_cost is not None else ""
+            print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  "
+                  f"{_fmt_ts(r.started_at)}{money}")
             if r.summary:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+        total, priced, unpriced = kcost.card_cost(
+            getattr(r, "session_id", None) for r in runs)
+        if total is not None:
+            note = "" if not unpriced else f" ({unpriced} run(s) unattributable)"
+            print(f"  cost: {kcost.format_cost(total)} across {priced} session(s){note}")
+        elif runs:
+            print("  cost: unknown - no run on this card carries a priced session")
     return 0
 
 

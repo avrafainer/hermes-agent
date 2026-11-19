@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -123,6 +124,16 @@ class DispatchResult:
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
     on multi-lane setups, NOT operator-actionable; tracked apart so health
     telemetry can tell "stuck" from "correctly idle"."""
+    skipped_attempts_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """``(task_id, assignee, attempts_today)`` for a card left alone because it has
+    already been launched ``kanban.max_attempts_per_card_per_day`` times today.
+    The lane budget below counts *all* launches; this counts one card's, which is
+    the only way to notice a single card thrashing without starving the others."""
+    skipped_session_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """``(task_id, assignee, sessions_today)`` for ready cards left alone because
+    that profile has already started ``kanban.max_sessions_per_profile_per_day``
+    workers today. Distinct from the *concurrency* cap: this one is a daily budget
+    of launches, so it does not clear when the profile's workers finish."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -135,10 +146,17 @@ class DispatchResult:
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+    skipped_spend_capped: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` refused before any claim or subprocess because the
+    unattended spend lane is spent. Nothing ran, so no retry budget is touched;
+    the card stays queued and is picked up once the lane has room."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    skipped_credits_paused: list[tuple[str, str, int]] = field(default_factory=list)
+    """``(task_id, profile, pause_until)`` left alone because the lane's provider
+    wallet is empty: another spawn would only re-buy the same refusal."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -169,8 +187,13 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             continue
         for _task_id, reason in res.respawn_guarded:
             counts[reason] = counts.get(reason, 0) + 1
+        if res.skipped_spend_capped:
+            counts["spend_capped"] = counts.get("spend_capped", 0) + len(res.skipped_spend_capped)
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_credits_paused:
+            counts["credits_paused"] = (counts.get("credits_paused", 0)
+                                        + len(res.skipped_credits_paused))
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -509,7 +532,8 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     One row's failure (signal, /proc probe) is logged and skips only that row.
     Returns the task ids whose worker was terminated."""
     rows = conn.execute(
-        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock FROM task_runs "
+        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock, session_id "
+        "FROM task_runs "
         "WHERE ended_at IS NOT NULL AND ended_at <= ? "
         "AND worker_pid IS NOT NULL AND worker_started_at IS NOT NULL",
         (int(time.time()) - TERMINAL_WORKER_REAP_GRACE_SECONDS,),
@@ -546,6 +570,14 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
             "WHERE id = ? AND worker_pid = ? AND worker_started_at = ?",
             (row["id"], pid, fingerprint),
         )
+        # This worker will never report its session itself, so read it out of the
+        # log now, while the row is in hand. Without it the card's spend stays
+        # unattributable for exactly the runs that failed.
+        if row["session_id"] is None:
+            session_id = _session_id_from_log(row["task_id"])
+            if session_id:
+                conn.execute("UPDATE task_runs SET session_id = ? WHERE id = ?",
+                             (session_id, row["id"]))
         if alive:
             _kb._append_event(
                 conn, row["task_id"], "terminal_worker_reaped",
@@ -1047,6 +1079,8 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    credit_wall: Optional[str] = None
+    """The provider's out-of-money phrasing found in the worker's last output."""
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
@@ -1074,6 +1108,10 @@ def _classify_dead_worker(
         if worker_output:
             dead.error_text += f"{WORKER_OUTPUT_SEP}{worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
+            wall = _credit_wall_signature(worker_output)
+            if wall:
+                dead.credit_wall = wall
+                dead.event_payload["credit_wall"] = wall
     return dead
 
 
@@ -1194,6 +1232,17 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
+            # A provider wallet that is empty cannot be waited out by retrying: pause
+            # the lane for the configured window, and record ONE event per window
+            # rather than one per dead worker in a fan-out.
+            paused_now = None
+            if dead.credit_wall:
+                paused_now = _pause_lane(row["assignee"], dead.credit_wall,
+                                         _provider_credit_pause_seconds())
+            elif dead.kind != "rate_limited":
+                # This worker reached its provider and got a real answer, so the
+                # wallet is not empty any more: lift any pause on the lane early.
+                _clear_lane_pause(row["assignee"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1212,6 +1261,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+            if paused_now is not None:
+                _kb._append_event(conn, row["id"], "provider_credits_exhausted", {
+                    "profile": row["assignee"],
+                    "signature": dead.credit_wall,
+                    "until": round(paused_now["until"]),
+                    "seconds": paused_now["seconds"],
+                    "pid": pid,
+                }, run_id=run_id)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -1602,17 +1659,15 @@ def check_respawn_guard(
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
+        # A quota reset is not authorization to resume unattended work.  Keep the
+        # task guarded until an operator explicitly unblocks/requeues it.  A
+        # later lifecycle event is the durable evidence of that decision.
         ended_at = _kb._to_epoch(latest_run["ended_at"])
-        if ended_at is not None and (now - ended_at) < rl_cooldown:
-            return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
-        return None
+        if ended_at is not None and any(_rows_since(
+                conn, "task_events", task_id, ended_at,
+                "AND kind IN ('status', 'promoted', 'unblocked')", strict=True)):
+            return None
+        return "rate_limit_manual_resume"
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
@@ -2036,6 +2091,13 @@ def dispatch_once(
     return result
 
 
+def _spend_gate():
+    """Late import: keeps the dispatcher importable when the guard is absent."""
+    from hermes_cli import spend_gate
+
+    return spend_gate
+
+
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
@@ -2047,6 +2109,214 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
+
+
+def _ceiling_int(raw: object) -> Optional[int]:
+    """``raw`` as a ceiling, or None when it is unset, empty or nonsense."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _daily_launch_cap(raw: object, profile: str) -> Optional[int]:
+    """Resolve ``kanban.max_sessions_per_profile_per_day`` for one profile.
+
+    The value is either a single int (every profile gets it) or a map from profile
+    name to int with an optional ``default`` for the ones it does not name. Lanes
+    are not comparable — the Pi lane bursts to 300+ launches on a batch day while
+    ``chief-of-staff`` has taken twelve in a fortnight — so one flat number either
+    walls off the busy lane or is useless on the quiet ones.
+    """
+    if isinstance(raw, Mapping):
+        named = _ceiling_int(raw.get(profile))
+        if named is not None:
+            return named
+        # "_default" is the fallback key: a profile is actually named "default" on
+        # this machine, so a bare "default" has to mean that lane, not everyone else.
+        return _ceiling_int(raw.get("_default", raw.get("default")))
+    return _ceiling_int(raw)
+
+
+def _max_sessions_per_profile_per_day(profile: str = "") -> Optional[int]:
+    """Daily worker-launch ceiling for one profile, or None when unset.
+
+    ``kanban.max_sessions_per_profile_per_day``, as an int or a profile map.
+    Separate from ``max_in_progress_per_profile``: that one is concurrency (how many
+    may run at once), this one is a day's worth of launches. 615 sessions in twelve
+    days was 51 a day against a ceiling of four, each paying a cold start and a
+    cache write.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "max_sessions_per_profile_per_day")
+    except Exception:
+        return None
+    return _daily_launch_cap(raw, profile)
+
+
+def _max_attempts_per_card_per_day() -> Optional[int]:
+    """How many launches one *card* may have in a day before it is left alone.
+
+    ``kanban.max_attempts_per_card_per_day``. The daily lane budget cannot catch a
+    single card thrashing: on 2026-10-30 the Pi lane spent 726 runs over 179 cards
+    and some batch cards were launched 9-11 times, which a lane-wide number only
+    notices by refusing everyone else too. Unset (or 0) means no per-card ceiling.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "max_attempts_per_card_per_day")
+    except Exception:
+        return None
+    return _ceiling_int(raw)
+
+
+def _local_midnight() -> int:
+    lt = time.localtime()
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+
+
+# --- Provider wallet wall -------------------------------------------------
+# The only place a provider says "you are out of money" is a dead worker's last
+# output. On 2026-10-30 that sentence was written 369 times in a single hour and
+# dispatch kept spawning: the local spend guard watches Avra's daily ceiling, not
+# an account wallet at OpenRouter. Recognise the sentence, pause the lane, say so
+# once.
+
+_CREDIT_WALL_SIGNATURES: tuple[str, ...] = (
+    "out of credits",
+    "credit limit is exhausted",
+    "insufficient credits",
+    "out of credit",
+    "add credits",
+)
+
+
+def _credit_wall_signature(text: Optional[str]) -> Optional[str]:
+    """The provider's out-of-money phrasing in a worker's last words, if any."""
+    if not text:
+        return None
+    low = text.lower()
+    for sig in _CREDIT_WALL_SIGNATURES:
+        if sig in low:
+            return sig
+    return None
+
+
+def _pauses_path() -> Path:
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return home / "cache" / "dispatch-pauses.json"
+
+
+def _read_pauses() -> dict:
+    try:
+        data = json.loads(_pauses_path().read_text())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_pauses(pauses: dict) -> None:
+    path = _pauses_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(pauses, indent=2, sort_keys=True) + "\n")
+        tmp.replace(path)
+    except OSError:
+        # A lane that cannot record its pause must not crash the tick; the next
+        # dead worker re-detects the wall anyway.
+        pass
+
+
+def _lane_pause(profile: Optional[str]) -> Optional[dict]:
+    """The active pause for a lane, or None (expired entries read as None)."""
+    if not profile:
+        return None
+    entry = _read_pauses().get(profile)
+    if not isinstance(entry, dict):
+        return None
+    try:
+        until = float(entry.get("until", 0))
+    except (TypeError, ValueError):
+        return None
+    return entry if until > time.time() else None
+
+
+def _pause_lane(profile: Optional[str], signature: str, seconds: int) -> Optional[dict]:
+    """Pause a lane. Returns the entry only when the lane was NOT already paused."""
+    if not profile or seconds <= 0:
+        return None
+    already = _lane_pause(profile)
+    pauses = _read_pauses()
+    now = time.time()
+    pauses[profile] = {
+        "until": now + seconds,
+        "since": now,
+        "signature": signature,
+        "seconds": seconds,
+    }
+    _write_pauses(pauses)
+    return None if already else pauses[profile]
+
+
+def _clear_lane_pause(profile: Optional[str]) -> None:
+    """Lift a pause early: a worker on this lane reached its provider and worked."""
+    if not profile:
+        return
+    pauses = _read_pauses()
+    if profile in pauses:
+        pauses.pop(profile, None)
+        _write_pauses(pauses)
+
+
+def _provider_credit_pause_seconds() -> int:
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("provider_credits_pause_seconds")
+    except Exception:
+        return 1800
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 1800
+    return max(0, value)
+
+
+def _attempts_today(conn: sqlite3.Connection, task_id: str) -> int:
+    """Launches this one card has had since local midnight."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ? AND started_at >= ?",
+        (task_id, _local_midnight()),
+    ).fetchone()
+    return int(row["n"] if row is not None else 0)
+
+
+def _sessions_started_today(conn: sqlite3.Connection, profile: str) -> int:
+    """Worker runs this profile started since local midnight (runs, not cards)."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_runs WHERE profile = ? AND started_at >= ?",
+        (profile, _local_midnight()),
+    ).fetchone()
+    return int(row["n"] if row is not None else 0)
+
+
+_SESSION_ID_IN_LOG_RE = re.compile(r"session_id:\s*([A-Za-z0-9_\-]+)")
+
+
+def _session_id_from_log(task_id: str) -> str:
+    """Best-effort session id from a worker's log trailer; "" when absent."""
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=12000)
+    except Exception:
+        return ""
+    match = _SESSION_ID_IN_LOG_RE.search(raw or "")
+    return match.group(1) if match else ""
 
 
 def _dispatch_lane_task(
@@ -2097,6 +2367,77 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # Provider wallet wall: when this lane's provider reported the account empty,
+    # nothing on it can succeed until the pause expires — refuse before the claim so
+    # the card keeps its retry budget and the board shows why it is waiting.
+    pause = _lane_pause(assignee)
+    if pause is not None:
+        until = int(pause.get("until", 0))
+        result.skipped_credits_paused.append((task_id, assignee, until))
+        if not dry_run:
+            with _kb.write_txn(conn):
+                last = conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                if last is None or last["kind"] != "spawn_refused_credits_paused":
+                    _kb._append_event(conn, task_id, "spawn_refused_credits_paused",
+                                      {"profile": assignee, "until": until})
+        return False
+    # Daily launch budget for this profile. Checked before the claim so a refusal
+    # leaves the retry budget and the card's history untouched; the event says how
+    # many it has already started, so the board answers "why is this stuck".
+    # Per-card attempt ceiling first: a card thrashing on its own is invisible to a
+    # lane-wide budget until it has already spent the lane's whole day.
+    attempts_cap = _max_attempts_per_card_per_day()
+    if attempts_cap is not None:
+        attempts = _attempts_today(conn, task_id)
+        if attempts >= attempts_cap:
+            result.skipped_attempts_capped.append((task_id, assignee, attempts))
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    last = conn.execute(
+                        "SELECT kind FROM task_events WHERE task_id = ? "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                    if last is None or last["kind"] != "spawn_refused_attempt_cap":
+                        _kb._append_event(conn, task_id, "spawn_refused_attempt_cap",
+                                          {"profile": assignee, "cap": attempts_cap,
+                                           "attempts_today": attempts})
+            return False
+    session_cap = _max_sessions_per_profile_per_day(assignee)
+    if session_cap is not None:
+        started = _sessions_started_today(conn, assignee)
+        if started >= session_cap:
+            result.skipped_session_capped.append((task_id, assignee, started))
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    last = conn.execute(
+                        "SELECT kind FROM task_events WHERE task_id = ? "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                    if last is None or last["kind"] != "spawn_refused_session_cap":
+                        _kb._append_event(conn, task_id, "spawn_refused_session_cap",
+                                          {"profile": assignee, "cap": session_cap,
+                                           "sessions_today": started})
+            return False
+    # Spend ceiling at the spawn boundary. The wire-level guard already refuses a
+    # paid request, so a worker spawned into a spent lane would only burn a claim,
+    # a cold start and a card that looks crashed. Refuse before the claim instead,
+    # and leave the retry budget untouched: being out of budget is not the card's
+    # fault and it must resume when the lane refills.
+    allowed, spend_reason = _spend_gate().check_spawn_allowed(assignee)
+    if not allowed:
+        result.skipped_spend_capped.append((task_id, spend_reason))
+        if not dry_run:
+            with _kb.write_txn(conn):
+                last = conn.execute(
+                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                if (last is None or last["kind"] != "spawn_refused_spend_cap"
+                        or last["payload"] != _kb._json_or_null({"reason": spend_reason})):
+                    _kb._append_event(conn, task_id, "spawn_refused_spend_cap",
+                                      {"reason": spend_reason})
+        _kb._log.warning("kanban dispatcher: %s held back, spend lane is spent: %s",
+                         task_id, spend_reason)
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))

@@ -31,6 +31,7 @@ import { $backgroundRunningSessionIds } from './composer-status'
 import { $liveWorkRoster, noteEventFed, rosterLiveIds, rosterSaysIdle } from './live-work-roster'
 import { $pausedQueueSessionIds } from './owner-queue-reconcile'
 import { $cronSessions, $messagingSessions, $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
+import { $focusedStoredSessionId } from './session-focus'
 import {
   $attentionSessionIds,
   $draftSessionIds,
@@ -130,7 +131,8 @@ export const $sessionDotStateById = computed(
     $messagingSessions,
     $cronSessions,
     $unreadWriteGuard,
-    $pausedQueueSessionIds
+    $pausedQueueSessionIds,
+    $focusedStoredSessionId
   ],
   (
     attention,
@@ -144,13 +146,24 @@ export const $sessionDotStateById = computed(
     messaging,
     cron,
     unreadWriteGuard,
-    paused
+    paused: readonly string[],
+    focused: string | null
   ) => {
     const next: Record<string, SessionDotState> = {}
+
+    // Whatever you are currently looking at is, by definition, read. Both unread sources below
+    // are proxies for "something here you haven't opened", and a stale server watermark or a
+    // marker persisted before a restart can outlive the fact that the session is on screen. This
+    // is the guarantee that cannot be repainted away by the next list page.
+    const focusedAliases = new Set(focused ? lineageAliases(focused, sessions) : [])
 
     const claim = (ids: readonly string[], state: SessionDotState) => {
       for (const id of ids) {
         for (const alias of lineageAliases(id, sessions)) {
+          if (state === 'unread' && focusedAliases.has(alias)) {
+            continue
+          }
+
           next[alias] = state
         }
       }
