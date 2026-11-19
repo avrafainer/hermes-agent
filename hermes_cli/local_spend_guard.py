@@ -21,7 +21,12 @@ from zoneinfo import ZoneInfo
 
 from hermes_constants import get_hermes_home
 
-VERSION = "2026-10-30-v4-unattended-only"
+VERSION = "2026-11-18-v5-trusted-loopback-route"
+
+# Endpoints the owner has explicitly declared unmetered. Exact host+port only:
+# trusting every loopback port would also trust a local proxy that forwards to a
+# billed provider, which is the hole this file exists to avoid.
+TRUSTED_ROUTES_FILE = "spend-guard-trusted-routes.json"
 
 # Legacy recovery readers remain only so historical recovery records can be
 # inspected by older tooling. No enforcement or CLI path can activate them.
@@ -416,6 +421,38 @@ def save_settings(data):
             os.unlink(name)
 
 
+def _trusted_loopback_route(host, port):
+    """A loopback endpoint the owner declared unmetered, by exact host and port.
+
+    Some loopback services are not metered models: the ChatGPT subscription bridge
+    holds a local endpoint whose cost is already the subscription, so there is no
+    per-token meter to read. The declaration lives in
+    ``spend-guard-trusted-routes.json`` in the shared home rather than in this
+    module, so an exception is data with a name and a date, not a code edit. An
+    unreadable, malformed or non-matching file trusts nothing.
+    """
+    if not port:
+        return False
+    try:
+        payload = json.loads((_shared_home() / TRUSTED_ROUTES_FILE).read_text())
+    except Exception:
+        return False
+    routes = payload.get("loopback") if isinstance(payload, dict) else None
+    if not isinstance(routes, list):
+        return False
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        try:
+            entry_port = int(str(route.get("port")).strip())
+        except (TypeError, ValueError):
+            continue
+        entry_host = str(route.get("host") or "").strip().lower().rstrip(".")
+        if entry_host == host and entry_port == port:
+            return True
+    return False
+
+
 def route_kind(provider=None, base_url=None):
     prov = str(provider or "").lower().strip()
     url = urlparse(str(base_url or ""))
@@ -434,6 +471,11 @@ def route_kind(provider=None, base_url=None):
         return "local"
     # Ollama's standard loopback endpoint is also used under the custom provider.
     if local_host and url.port == 11434:
+        return "local"
+    # A named, owner-declared loopback route. The runtime rewrites local-server
+    # provider labels (ollama, local, vllm) to "custom" before the wire, so the
+    # label cannot be the carrier for this; the endpoint has to be.
+    if local_host and _trusted_loopback_route(host, url.port):
         return "local"
     return "untracked"
 

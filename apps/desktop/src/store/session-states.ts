@@ -749,6 +749,9 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
     // re-lights even if it lands within the same millisecond as the last
     // read (same-tick submit → finish in tests and fast local models).
     clearReadBaseline(storedId)
+    // Remember how the turn began: a turn started in front of the user stays read when it
+    // finishes after they have moved on (see turnStartedFocused).
+    turnStartedFocused.set(storedId, storedId === $focusedStoredSessionId.get())
   } else if (!next.busy && wasWorking) {
     markSettled(storedId)
 
@@ -792,6 +795,15 @@ function lightUnreadCompletion(storedId: string, runtimeId?: string) {
     return
   }
 
+  // The turn began in front of the user: they asked for this answer and watched it start, so
+  // it is read even though it finished after they moved on. Cleared on settle so the flag
+  // describes one turn only.
+  if (turnStartedFocused.get(storedId) === true) {
+    turnStartedFocused.delete(storedId)
+
+    return
+  }
+
   // Re-light only genuinely new completions: if the user already viewed
   // this session (or its family) at or after this settle moment, a
   // re-assert of the same completion must not re-arm the dot. `-1` for
@@ -812,6 +824,12 @@ function lightUnreadCompletion(storedId: string, runtimeId?: string) {
  *  `confirmReconnectSettlesExcept` when the runtime is idle or gone, a busy
  *  re-assert (stream event or `working` row) when the turn is still live. */
 const unconfirmedReconnectSettles = new Map<string, string>()
+
+/** Whether the turn currently running was started while the user was looking at the
+ *  session. A reply that lands after they switch away is not unread mail: they asked for
+ *  it and watched it begin. Without this, every conversation they leave mid-turn comes
+ *  back with a green dot the moment the answer finishes. */
+const turnStartedFocused = new Map<string, boolean>()
 let deferringReconcileUnread = false
 
 /** A fresh authoritative snapshot arrived: every parked completion whose
@@ -3044,8 +3062,14 @@ function ackSessionAsSeen(storedSessionId: null | string) {
   clearUnreadOnOpen(storedSessionId).catch(() => {})
 }
 
+// The session you leave is also read: the final message of a turn advances last_active, so
+// acking only on entry leaves every conversation you just finished sitting there unread.
+let previouslyFocused: null | string = $focusedStoredSessionId.get()
+
 $focusedStoredSessionId.listen(focused => {
+  ackSessionAsSeen(previouslyFocused)
   ackSessionAsSeen(focused)
+  previouslyFocused = focused
   stampTileSessionFocus(focused)
 })
 

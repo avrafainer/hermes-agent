@@ -73,14 +73,20 @@ export async function markSessionUnread(storedId: string, unread: boolean): Prom
 }
 
 /** Opening a session clears its persisted unread flag (auto-mark-read).
+ *
+ *  Always writes. The client's own `row.unread` can disagree with the backend watermark,
+ *  and when it did (a session sat at last_read_at = 10:57 while 371 messages landed) this
+ *  function's `row.unread !== true` guard meant the PATCH was never sent, so opening the
+ *  session could not reconcile anything: the server kept reporting unread and the sidebar
+ *  kept repainting the dot. Gating a repair on the copy that is wrong is how you get a bug
+ *  that survives every fix. The server settles it; the write guard keeps a stale list page
+ *  from overwriting what we just wrote.
+ *
  *  Best-effort: a failed PATCH is healed by the next honest refresh. */
 export async function clearUnreadOnOpen(storedId: string): Promise<void> {
   const row = rowFor(storedId)
 
-  // A session with no loaded row — a tile, a workspace pane, a session owned by a profile the
-  // list has not loaded — still has a server-side watermark, and returning here was why its dot
-  // never cleared: the PATCH that would have cleared it was never sent, so every refresh read
-  // unread=true straight back off the server.
+  // No loaded row (a tile, a workspace pane, another profile's session): PATCH by id.
   if (!row) {
     try {
       await setSessionUnreadRemote(storedId, false)
@@ -88,10 +94,6 @@ export async function clearUnreadOnOpen(storedId: string): Promise<void> {
       // Ignore: the dot simply returns until a refresh reconciles.
     }
 
-    return
-  }
-
-  if (row.unread !== true) {
     return
   }
 
