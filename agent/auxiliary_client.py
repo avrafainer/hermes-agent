@@ -2617,6 +2617,12 @@ def _relay_sync_completion(
 ) -> Any:
     from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
 
+    from agent.automated_model_authorization import enforce_automated_model_authorization
+    from hermes_cli.local_spend_guard import enforce
+
+    enforce(provider=provider, base_url=str(getattr(client, "base_url", "") or ""))
+    enforce_automated_model_authorization(
+        provider=provider, base_url=str(getattr(client, "base_url", "") or ""))
     kwargs = prepare_chat_messages(client, kwargs)
     # The progress hook is installed per TASK, so every attempt (retries, recovery rungs, fallbacks)
     # must stream through _create_with_progress or the compression watchdog sees silence (#98466).
@@ -2628,11 +2634,19 @@ def _relay_sync_completion(
     judged: list[_ClassifiedAttempt] = []
     callback = _provider_callback(
         create or (lambda request: _create_with_progress(client, request, task, provider=provider or "")), judged)
+
+    def provider_call(request):
+        from agent.interactive_spending import route_attended_openrouter_request
+
+        routed = route_attended_openrouter_request(
+            request, provider=provider, base_url=str(getattr(client, "base_url", "") or ""))
+        return _run_protected_sync_provider_call(callback, routed)
+
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Isolate only the provider callback so the owning thread can unwind its lease/DB
     # transaction on hard cancel without touching the shared client.
     if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
+        return provider_call(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
     from agent.auxiliary_hooks import run_with_aux_hooks
@@ -2640,7 +2654,7 @@ def _relay_sync_completion(
     try:
         return run_with_aux_hooks(
             lambda: relay_llm.execute_current(
-                kwargs, lambda request: _run_protected_sync_provider_call(callback, request),
+                kwargs, provider_call,
                 name=provider_name, model_name=model_name, metadata=relay_chat_metadata(metadata),
                 defer_logical_completion=True,
             ),
@@ -2660,14 +2674,28 @@ async def _relay_async_completion(
 ) -> Any:
     from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
 
+    from agent.automated_model_authorization import enforce_automated_model_authorization
+    from hermes_cli.local_spend_guard import enforce
+
+    enforce(provider=provider, base_url=str(getattr(client, "base_url", "") or ""))
+    enforce_automated_model_authorization(
+        provider=provider, base_url=str(getattr(client, "base_url", "") or ""))
     kwargs = prepare_chat_messages(client, kwargs)
     # Async twin of the seam default above (#98466).
     judged: list[_ClassifiedAttempt] = []
     callback = _provider_callback_async(
         create or (lambda request: _acreate_with_progress(client, request, provider=provider or "")), judged)
+
+    async def provider_call(request):
+        from agent.interactive_spending import route_attended_openrouter_request
+
+        routed = route_attended_openrouter_request(
+            request, provider=provider, base_url=str(getattr(client, "base_url", "") or ""))
+        return await callback(routed)
+
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
-        return await callback(kwargs)
+        return await provider_call(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
     from agent.auxiliary_hooks import arun_with_aux_hooks
@@ -2675,7 +2703,7 @@ async def _relay_async_completion(
     try:
         return await arun_with_aux_hooks(
             lambda: relay_llm.execute_current_async(
-                kwargs, callback, name=provider_name, model_name=model_name,
+                kwargs, provider_call, name=provider_name, model_name=model_name,
                 metadata=relay_chat_metadata(metadata), defer_logical_completion=True,
             ),
             aux_task=str(metadata.get("auxiliary_task") or ""), metadata=metadata, client=client, kwargs=kwargs,
@@ -2693,10 +2721,21 @@ def _relay_sync_stream(
 ) -> Any:
     from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
 
+    from agent.automated_model_authorization import enforce_automated_model_authorization
+    from hermes_cli.local_spend_guard import enforce
+
+    enforce(provider=provider, base_url=str(getattr(client, "base_url", "") or ""))
+    enforce_automated_model_authorization(
+        provider=provider, base_url=str(getattr(client, "base_url", "") or ""))
     kwargs = prepare_chat_messages(client, kwargs)
     # The bypass runs inside the provider callback, AFTER Relay has seen (and possibly
     # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
-    create = lambda request: client.chat.completions.create(**bypass_chat_sdk_request_transform(request, client))
+    def create(request):
+        from agent.interactive_spending import route_attended_openrouter_request
+
+        routed = route_attended_openrouter_request(
+            request, provider=provider, base_url=str(getattr(client, "base_url", "") or ""))
+        return client.chat.completions.create(**bypass_chat_sdk_request_transform(routed, client))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return create(kwargs)

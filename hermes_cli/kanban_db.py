@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_work_types import apply_work_type
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -235,7 +236,7 @@ def notify_task_updated(
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
-    "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
+    "respawn_guarded", "skipped_per_profile_capped", "skipped_session_capped", "skipped_unassigned",
     "skipped_nonspawnable",
 )
 
@@ -619,6 +620,7 @@ class Task:
     worker_pid: Optional[int] = None
     last_failure_error: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
+    work_type: Optional[str] = None          # what kind of job this is; set at creation
     last_heartbeat_at: Optional[int] = None
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
@@ -670,6 +672,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "work_type",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -698,6 +701,9 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # Hermes session of the worker that owned this attempt; None for runs that
+    # predate the column or died before the id could be read.
+    session_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Run:
@@ -711,6 +717,8 @@ class Run:
             **{col: _to_epoch(row[col]) for col in ("claim_expires", "last_heartbeat_at", "ended_at")},
             id=int(row["id"]), started_at=_to_epoch(row["started_at"]) or 0,
             metadata=_json_or(_lossy_text(row["metadata"])),
+            session_id=(_lossy_text(row["session_id"])
+                        if "session_id" in row.keys() else None),
         )
 
 
@@ -930,7 +938,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Hermes session id of the worker that ran this attempt. Recorded when the
+    -- worker closes its own run (from HERMES_SESSION_ID) or, for a worker that
+    -- died, parsed out of its log trailer at reap. It is what lets a card's
+    -- spend be looked up instead of estimated.
+    session_id          TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1154,11 +1167,47 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+# Words a card body uses when it already states how the worker finishes. Checked
+# case-insensitively; any one of them means the operator wrote a contract and we
+# leave the body alone rather than stacking a second one on top.
+_EXIT_CONTRACT_MARKERS = ("exit contract", "done when", "done-when", "definition of done",
+                          "stop when", "acceptance criteria", "completion contract")
+
+EXIT_CONTRACT_TEMPLATE = """
+## Exit contract
+
+- **Finish by claiming it.** End with `kanban complete <id>` and a one-to-three sentence summary,
+  or `kanban block <id>` with the reason if you cannot. A run that ends without one of those
+  leaves the board unable to tell finished work from abandoned work.
+- **Verify before claiming.** Run the check named above and put the command and its real output
+  in the summary. Do not describe a result you did not observe.
+- **Stop when the stated outcome is met.** Do not widen the scope, fix adjacent things, or start
+  a review pass because it is possible.
+"""
+
+
+def ensure_exit_contract(body: Optional[str], title: str = "") -> str:
+    """Return ``body`` with an exit contract, adding the standard one if absent.
+
+    A card whose body never says how the worker finishes is the card whose worker
+    ends silently: 34 of them did exactly that before this existed, and the board
+    could not tell them from cards that were never picked up.
+    """
+    text = (body or "").strip()
+    lowered = text.lower()
+    if text and any(marker in lowered for marker in _EXIT_CONTRACT_MARKERS):
+        return body if body is not None else text
+    if not text:
+        text = f"## Task\n\n{title.strip() or 'As titled.'}"
+    return text.rstrip() + "\n" + EXIT_CONTRACT_TEMPLATE
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
-    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
+    branch_name: Optional[str] = None, tenant: Optional[str] = None,
+    priority: Optional[int] = None,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
@@ -1168,6 +1217,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    work_type: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1242,6 +1292,19 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Every card that a profile will actually be asked to execute carries an exit
+    # contract, whether or not its author remembered one. Cards with no assignee
+    # are excluded: nothing runs them, so the contract would be decoration.
+    if assignee:
+        body = ensure_exit_contract(body, title)
+
+    # A work type carries this board's runtime expectation and ordering weight for
+    # that kind of job. Explicit arguments win; an unknown type changes nothing.
+    priority, max_runtime_seconds = apply_work_type(
+        work_type, priority=priority, max_runtime_seconds=max_runtime_seconds)
+    if priority is None:
+        priority = 0
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -1267,8 +1330,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        work_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1278,6 +1342,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        work_type,
                     ),
                 )
                 for pid in parents:
@@ -1869,6 +1934,10 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    # The worker that calls this is the only process that knows its own Hermes
+    # session, so capture it here while it is in scope. COALESCE keeps a value
+    # already parsed from the log rather than overwriting it with a blank.
+    worker_session = os.environ.get("HERMES_SESSION_ID") or None
     conn.execute(
         """
         UPDATE task_runs
@@ -1878,11 +1947,13 @@ def _end_run(
                error         = ?,
                metadata      = ?,
                ended_at      = ?,
-               claim_expires = NULL
+               claim_expires = NULL,
+               session_id    = COALESCE(session_id, ?)
          WHERE id = ?
            AND ended_at IS NULL
         """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+        (status or outcome, outcome, summary, error, _json_or_null(metadata), now,
+         worker_session, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id

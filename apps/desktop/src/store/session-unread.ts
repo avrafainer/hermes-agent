@@ -437,16 +437,29 @@ export function ackStoredSessionId(storedSessionId: null | string, profileHint?:
   }
 
   const profile = unlistedProfile(profileHint)
-  const markers = $unreadFinishedMarkers.get()[profile]
+  const buckets = $unreadFinishedMarkers.get()
 
-  if (!markers) {
-    return
+  // With no hint, the row being unloaded leaves the owner ambiguous: a session living
+  // in a profile the gateway is not homed on holds its marker in that profile's bucket,
+  // so acking only the active one clears nothing and the dot repaints on the next
+  // refresh. A stored id identifies exactly one conversation, so retiring it wherever
+  // it is marked cannot touch an unrelated session, and it keeps the hinted path exact.
+  const owners = profileHint ? [profile] : Object.keys(buckets)
+  let changed = false
+
+  for (const owner of owners) {
+    const markers = buckets[owner]
+
+    if (!markers?.includes(storedSessionId)) {
+      continue
+    }
+
+    setMarkerBucket(owner, markers.filter(id => id !== storedSessionId))
+    changed = true
   }
 
-  const next = markers.filter(id => id !== storedSessionId)
-
-  if (next.length !== markers.length) {
-    setMarkerBucket(profile, next)
+  if (changed) {
+    return
   }
 }
 

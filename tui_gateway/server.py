@@ -54,6 +54,7 @@ from tui_gateway.contracts import registry as _contracts
 from tui_gateway.user_messages import (
     AGENT_BUILD_ABANDONED, AGENT_MISSING_FOR_TURN, AGENT_STILL_STARTING, agent_init_failed_message, busy_message,
     resume_failed_message, turn_error_text)
+from tui_gateway.session_transports import _session_has_live_transport
 from tui_gateway.transport import (FanoutTransport, StdioTransport, Transport, bind_transport,
                                    current_transport, reset_transport)
 from hermes_cli._startup_fast import project_root_str
@@ -909,6 +910,21 @@ def _session_for_key(session_key: str) -> dict | None:
         return next((s for s in list(_sessions.values()) if s.get("session_key") == session_key), None)
 
 
+# App surfaces where a human typed the prompt.  "desktop" is the Mac app; "gui" is the
+# packaged mobile/tablet client, which reaches this server over the network.  Both carry a
+# live transport and an authenticated login, so both are attended turns for spend purposes.
+# Before 2026-11-02 only "desktop" qualified, so every phone turn was priced against the
+# unattended budget and locked Avra out of her own assistant.
+ATTENDED_APP_SOURCES = frozenset({"desktop", "gui"})
+
+
+def _is_attended_app_turn(*, source: str, ui_session_id: str, has_live_transport: bool) -> bool:
+    """A human prompt from an authenticated app surface, not background work."""
+    return bool(str(source or "").strip().lower() in ATTENDED_APP_SOURCES
+                and ui_session_id
+                and has_live_transport)
+
+
 def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session_id: str = "") -> list:
     with contextlib.suppress(Exception):
         from gateway.session_context import set_session_vars
@@ -926,9 +942,15 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             # App-global backends multiplex profiles: prefer the live session's own home.
             profile = profile_name_for_home(sess.get("profile_home")) or profile
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
+        attended_desktop = _is_attended_app_turn(
+            source=source,
+            ui_session_id=ui_session_id,
+            has_live_transport=sess is not None and _session_has_live_transport(sess),
+        )
         return set_session_vars(
             session_key=session_key, session_id=session_id, source=source,
-            profile=profile, cwd=resolved, ui_session_id=ui_session_id, cron_session="")
+            profile=profile, cwd=resolved, ui_session_id=ui_session_id, cron_session="",
+            attended_desktop=attended_desktop)
     return []
 
 

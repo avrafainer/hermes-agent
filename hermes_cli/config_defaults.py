@@ -1875,6 +1875,22 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Daily count of worker launches per profile - a spend/"cold start" budget,
+        # not a concurrency cap. Either one int for every profile, or a map from
+        # profile name to int with an optional "default" for the rest. None = unlimited.
+        "max_sessions_per_profile_per_day": None,
+        # How many times one card may be launched in a day before dispatch leaves it
+        # alone. Catches a single thrashing card that a lane-wide budget would only
+        # notice by refusing every other card too. None or 0 = no per-card ceiling.
+        "max_attempts_per_card_per_day": 5,
+        # Seconds to stop spawning a lane after its provider reported the account
+        # out of credits. 0 disables the pause. Sized well past a burst: a wallet
+        # refill is a human act, and 369 launches bought the same sentence once.
+        "provider_credits_pause_seconds": 1800,
+        # Work type -> {"max_runtime_seconds": int, "priority": int}, applied when a
+        # card is created with that type. Ships empty on purpose: the numbers are the
+        # operator's, and an unconfigured type must leave a card exactly as it was.
+        "work_types": {},
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
