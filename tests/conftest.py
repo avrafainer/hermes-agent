@@ -452,6 +452,31 @@ def _reset_foreground_exit_fence():
 
 
 @pytest.fixture(autouse=True)
+def _kanban_legacy_authority_off(request):
+    """Kanban tests predate creation-time origin refusal and create unsessioned cards.
+
+    Under enforce they fail at create, so the legacy kanban modules run with
+    authority off. tests/authority sets its own mode and is untouched. config.yaml
+    authority.mode is never changed by this. A private MonkeyPatch is used so a
+    test's own monkeypatch.undo() cannot drop the override mid-test.
+    """
+    module = getattr(request.module, "__name__", "")
+    if "kanban" not in module or "tests.authority" in module:
+        yield
+        return
+    from hermes_cli import authority
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setenv("HERMES_AUTHORITY_MODE", "off")
+        # settings() lets a config authority block outrank the env var, so pin mode().
+        mp.setattr(authority, "mode", lambda: "off")
+        yield
+    finally:
+        mp.undo()
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_kanban_memory_guard(request, monkeypatch):
     """Pin the kanban dispatcher's memory guard to "no data" for every test.
 

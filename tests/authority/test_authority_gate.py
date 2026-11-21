@@ -324,11 +324,13 @@ def test_concurrency_cap_stops_live_children(home, auth, monkeypatch):
 
 
 def test_bind_child_inherits_the_parents_grant(home, auth):
+    # The parent must be attributable: its grant was issued in its own origin session.
+    # A bare bind on a parent with no origin passes nothing (see test_origin_and_inheritance).
     gid = _grant(auth, home)
+    _board(home, [("t_parent", "s1")])
     auth.bind("t_parent", gid)
     con = sqlite3.connect(home / "kanban.db")
-    con.executescript("create table if not exists task_links (parent_id text, child_id text);"
-                      "create table if not exists tasks (id text primary key, status text);")
+    con.executescript("create table if not exists task_links (parent_id text, child_id text);")
     con.commit()
     inherited = auth.bind_child(con, "t_child", "t_parent")
     con.close()

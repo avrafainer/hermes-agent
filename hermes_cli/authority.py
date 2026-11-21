@@ -463,7 +463,7 @@ def mint(*, message_id: str, session_id: str, scope_cite: str,
     return grant_id
 
 
-def bind(task_id: str, grant_id: str) -> None:
+def bind(task_id: str, grant_id: str, *, via: str = "direct") -> None:
     """Attach a card to a grant, refusing anything that is not a live, verifying grant.
 
     A string that merely looks like a grant id is not authority: the earlier version stored
@@ -489,6 +489,9 @@ def bind(task_id: str, grant_id: str) -> None:
     with db:
         db.execute("INSERT OR REPLACE INTO task_grants (task_id, grant_id, hmac) VALUES (?,?,?)",
                    (task_id, grant_id, mac))
+    # Every binding names its path. Before this line, bind() wrote nothing, and most of the
+    # board's bindings could not be explained afterwards.
+    _log(task_id, "bind", "allow", f"bound via {via}", mode(), grant=grant_id)
 
 
 
@@ -614,6 +617,11 @@ def check(task_id: str, action: str, *, profile: Optional[str] = None) -> tuple[
         # Ambiguity still resolves to unbound, never to allow.
         origin = _task_origin_session(task_id)
         if origin and derive_origin_grant(task_id, origin):
+            g, why = resolve(task_id)
+    if g is None:
+        # A decomposed child: its authority is an attributable parent's, bound once here so
+        # the card stops being skipped in silence.
+        if _inherit_from_parent(task_id):
             g, why = resolve(task_id)
     if g is None:
         verdict, reason = "needs_approval", why
@@ -805,14 +813,14 @@ def bind_child(con: sqlite3.Connection, child_task: str,
     """
     if not from_task:
         return None
-    g, _why = resolve(from_task, con=None)
+    g = attributable_grant(from_task)
     if g is None:
         return None
     ok, reason = admit_child(con, from_task)
     if not ok:
         _log(from_task, "create_child", "deny", reason, mode())
         return None
-    bind(child_task, g["grant_id"])
+    bind(child_task, g["grant_id"], via="create_child")
     _log(child_task, "create_child", "allow", f"inherited {g['grant_id']}", mode(),
          grant=g["grant_id"])
     return g["grant_id"]
@@ -873,7 +881,7 @@ def derive_origin_grant(task_id: str, session_id: Optional[str]) -> Optional[dic
             if not _row_ok(row):
                 return None  # tampered row: ambiguity resolves to unbound
             try:
-                bind(task_id, row["grant_id"])
+                bind(task_id, row["grant_id"], via="derive_origin")
             except BindRefused:
                 return None  # the row passed this check but bind refused it: stay unbound
             _log(task_id, "derive_origin", "allow",
@@ -882,6 +890,93 @@ def derive_origin_grant(task_id: str, session_id: Optional[str]) -> Optional[dic
                     "message_id": row["provenance_message"], "source": src}
     finally:
         db.close()
+    return None
+
+
+class OriginRefused(Exception):
+    """A card cannot be created with no origin session and no attributable ancestor grant."""
+
+
+def _interactive_session(session_id: Optional[str]) -> bool:
+    """True when the session exists and is a user-facing surface, not a worker or scheduler."""
+    if not session_id:
+        return False
+    state = pathlib.Path(os.environ.get("HERMES_STATE_DB") or _home() / "state.db")
+    try:
+        sc = sqlite3.connect(f"file:{state}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        row = sc.execute("select source from sessions where id=?", (session_id,)).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        sc.close()
+    if row is None:
+        return False
+    src = str(row[0] or "").strip().lower()
+    return bool(src) and src not in _NON_INTERACTIVE_SOURCES
+
+
+def _parent_ids(task_id: str) -> list[str]:
+    """Parent card ids from the board, read as a file (see _task_origin_session)."""
+    path = pathlib.Path(os.environ.get("HERMES_KANBAN_DB") or (_home() / "kanban.db"))
+    if not path.exists():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        return [r[0] for r in con.execute(
+            "select parent_id from task_links where child_id=? order by parent_id", (task_id,))]
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def attributable_grant(task_id: str, _depth: int = 0) -> Optional[dict]:
+    """The grant a card holds, if that grant may be passed on to a child or a dispatch.
+
+    Attributable means: the grant was issued in this card's own interactive origin session,
+    or the card holds the same grant as a parent whose grant is itself attributable. A grant
+    that reached a card by a bare bind (no origin, no attributable parent) is not passed on,
+    so inheritance cannot launder a hand-bound allowance down a tree. Grants are never
+    searched by name or by card; only the card's own task_links are walked.
+    """
+    g, _why = resolve(task_id)
+    if g is None or _depth > 8:
+        return None
+    origin = _task_origin_session(task_id)
+    if origin and origin == g.get("provenance_session") and _interactive_session(origin):
+        return g
+    for pid in _parent_ids(task_id):
+        pg = attributable_grant(pid, _depth + 1)
+        if pg is not None and pg["grant_id"] == g["grant_id"]:
+            return g
+    return None
+
+
+def _inherit_from_parent(task_id: str) -> Optional[str]:
+    """Bind a card to the attributable grant of a parent when it carries none of its own.
+
+    A decomposed child is created by the decomposer, which runs as a worker, so the card has
+    no interactive origin session and origin derivation can never bind it. What authorised
+    that work is the parent's grant. The child points at that same grant row, so spending
+    stays on the one allowance. A parent whose grant is not attributable passes nothing.
+    """
+    for pid in _parent_ids(task_id):
+        pg = attributable_grant(pid)
+        if pg is None:
+            continue
+        try:
+            bind(task_id, pg["grant_id"], via="inherit_from_parent")
+        except BindRefused:
+            return None
+        _log(task_id, "dispatch", "allow", f"inherited {pg['grant_id']} from parent {pid}",
+             mode(), grant=pg["grant_id"])
+        return pg["grant_id"]
     return None
 
 

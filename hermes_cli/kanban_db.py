@@ -1398,7 +1398,7 @@ def create_task(
                 try:
                     from hermes_cli import authority as _authority
                     _parent = creator_task_id or (next(iter(parents)) if parents else None)
-                    _parent_grant = _authority.resolve(_parent)[0] if _parent else None
+                    _parent_grant = _authority.attributable_grant(_parent) if _parent else None
                     if _parent_grant is not None:
                         _authority.bind_child(conn, task_id, _parent)
                     else:
@@ -1414,6 +1414,19 @@ def create_task(
                             }, run_id=None)
                 except Exception:
                     pass
+                # Refuse at creation, not silently at dispatch, when the card has no origin
+                # and no attributable ancestor. Triage cards are exempt: a specifier may
+                # give them an origin before promotion. Only enforce mode refuses; the
+                # other modes never block, so they never refuse here either.
+                from hermes_cli import authority as _authority
+                if (task_status != "triage" and _authority.mode() == "enforce"
+                        and _authority.resolve(task_id)[0] is None):
+                    raise _authority.OriginRefused(
+                        f"refused: card {task_id} ({title.strip()!r}) has no origin session "
+                        "and no attributable ancestor grant, so it could never dispatch. Create it "
+                        "from an interactive session that holds a live dispatch grant (pass "
+                        "session_id), or as a child of a card whose grant was issued in its own "
+                        "origin session.")
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
