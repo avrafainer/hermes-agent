@@ -22,6 +22,7 @@ pin the classification layer that the shapes build on.
 """
 from __future__ import annotations
 
+import inspect
 import sqlite3
 import time
 
@@ -191,3 +192,27 @@ def test_shape3_bare_imperative_binds_to_the_message_it_answers(home, auth):
     with pytest.raises(auth.MintRefused) as refused:
         _grant(auth, orphan_home, orphan, "fix it")
     assert "ambiguous" in str(refused.value)
+
+
+# --------------------------------------------------- the old override is gone for good
+
+def test_mint_offers_no_way_around_the_affirmative_check(home, auth):
+    """The gate cannot be stepped around, because there is no longer anything to step to.
+
+    `require_affirmative=False` was the route taken three times on 2026-11-20, and each
+    time it left a normal-looking grant with no record that the gate had been overruled.
+    The parameter is gone rather than defaulted: a caller that still tries the old escape
+    hatch gets a TypeError at the call site, so the attempt is loud and mints nothing.
+    """
+    assert "require_affirmative" not in inspect.signature(auth.mint).parameters
+
+    note = _turn(home, "user", "Here is what I found. The guard is off.")
+    with pytest.raises(TypeError):
+        auth.mint(message_id=str(note), session_id="s1", scope_cite="The guard is off",
+                  actions=("dispatch",), require_affirmative=False)
+
+    # The same message, through the real signature, still refuses on the gate's terms.
+    with pytest.raises(auth.MintRefused) as refused:
+        _grant(auth, home, note, "The guard is off")
+    assert "not affirmative" in str(refused.value)
+

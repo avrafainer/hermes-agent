@@ -382,9 +382,17 @@ def mint(*, message_id: str, session_id: str, scope_cite: str,
          actions: Iterable[str], project: Optional[str] = None,
          item_scope: Optional[str] = None, spend_limit: Optional[float] = None,
          expires_at: Optional[int] = None, parent_grant: Optional[str] = None,
-         granted_by: str = "avra", require_affirmative: bool = True) -> str:
+         granted_by: str = "avra") -> str:
     """Create a grant. Refuses in any unattended context, and refuses unless the
-    cited user message really exists and contains the quoted scope."""
+    cited user message really exists, contains the quoted scope, and reads as
+    authorisation.
+
+    There is deliberately no override. A message the gate cannot read as authorisation
+    is a gate defect, and the repair is a reviewed change to the classifier -- not a
+    keyword argument at a call site. The `require_affirmative=False` flag that used to
+    sit here was the route around the gate taken three times on 2026-11-20; it left a
+    normal-looking grant and no audit record, so nothing could later show the gate had
+    been stepped around."""
     ok, why = _interactive_context()
     if not ok:
         raise MintRefused(why)
@@ -399,16 +407,15 @@ def mint(*, message_id: str, session_id: str, scope_cite: str,
         con.close()
     if scope_cite.strip() and scope_cite.strip().lower() not in " ".join(text.split()).lower():
         raise MintRefused(f"quoted scope is not present in message {message_id}")
-    if require_affirmative:
-        ok, why = assess(text, scope_cite)
-        if not ok and why.startswith("ambiguous"):
-            # A bare imperative answers the message before it. Only an offer or a question
-            # can be answered that way, so "fix it" following a proposal is authorisation
-            # while "fix it" out of nowhere is not.
-            if _antecedent_is_a_reply(message_id, session_id):
-                ok, why = True, ""
-        if not ok:
-            raise MintRefused(f"message {message_id} is not affirmative: {why}")
+    ok, why = assess(text, scope_cite)
+    if not ok and why.startswith("ambiguous"):
+        # A bare imperative answers the message before it. Only an offer or a question
+        # can be answered that way, so "fix it" following a proposal is authorisation
+        # while "fix it" out of nowhere is not.
+        if _antecedent_is_a_reply(message_id, session_id):
+            ok, why = True, ""
+    if not ok:
+        raise MintRefused(f"message {message_id} is not affirmative: {why}")
 
     bad = [a for a in actions if a not in ACTIONS]
     if bad:
