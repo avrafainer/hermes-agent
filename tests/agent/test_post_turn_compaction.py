@@ -5,12 +5,18 @@ from __future__ import annotations
 import threading
 from types import SimpleNamespace
 
+import pytest
+
+import agent.post_turn_compaction as ptc
 from agent.compaction_events import attempt_payload
 from agent.post_turn_compaction import (
     TRIGGER,
     await_post_turn_compaction,
     schedule_post_turn_compaction,
 )
+from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON
+from agent.turn_finalizer import finalize_turn
+from tests.agent.test_turn_finalizer_interrupt_alternation import _StubAgent
 
 THRESHOLD = 1000
 
@@ -151,3 +157,70 @@ def test_telemetry_accepts_the_post_turn_trigger_label():
     }
     payload = attempt_payload(record)
     assert payload["trigger"] == TRIGGER
+
+
+# --- Hook gating: the finalizer schedules only for a committed, successful turn. ---------------
+
+def _finalize_turn(agent, *, interrupted=False, failed=False, exit_reason="completed", final="done"):
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": final}]
+    return finalize_turn(
+        agent,
+        final_response=final,
+        api_call_count=1,
+        interrupted=interrupted,
+        failed=failed,
+        messages=messages,
+        conversation_history=None,
+        effective_task_id="task-1",
+        turn_id="turn-1",
+        user_message="hi",
+        original_user_message="hi",
+        _should_review_memory=False,
+        _turn_exit_reason=exit_reason,
+    )
+
+
+@pytest.fixture
+def scheduled(monkeypatch):
+    calls = []
+
+    def _record(agent, messages, *, task_id):
+        calls.append({"messages_len": len(messages), "task_id": task_id, "persisted": agent.persisted_messages})
+        return True
+
+    monkeypatch.setattr(ptc, "schedule_post_turn_compaction", _record)
+    return calls
+
+
+def _over_threshold_agent():
+    agent = _StubAgent()
+    agent.compression_enabled = True
+    agent.context_compressor.last_prompt_tokens = 80_000
+    return agent
+
+
+@pytest.mark.parametrize(
+    "kwargs, persist_disabled",
+    [
+        ({"interrupted": True, "exit_reason": "interrupted_by_user"}, False),
+        ({"failed": True, "exit_reason": "error"}, False),
+        ({"exit_reason": PRE_LLM_BLOCK_EXIT_REASON}, False),
+        ({}, True),
+    ],
+    ids=["interrupted", "failed", "vetoed_pre_llm_block", "persist_disabled"],
+)
+def test_non_committed_turn_does_not_schedule(scheduled, kwargs, persist_disabled):
+    agent = _over_threshold_agent()
+    agent._persist_disabled = persist_disabled
+    _finalize_turn(agent, **kwargs)
+    assert scheduled == []
+
+
+def test_successful_over_threshold_turn_schedules_after_persist(scheduled):
+    agent = _over_threshold_agent()
+    _finalize_turn(agent)
+    assert len(scheduled) == 1
+    # The reply is persisted before the hook runs, so the scheduled run sees the committed turn.
+    assert scheduled[0]["persisted"] is not None
+    assert scheduled[0]["persisted"][-1]["content"] == "done"
+    assert scheduled[0]["task_id"] == "task-1"
