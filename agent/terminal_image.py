@@ -355,12 +355,29 @@ def local_image_path(candidate: Any) -> str | None:
 # Result fields that name an image the call produced (browser_exec, computer_use), read from the
 # result or from a multimodal envelope's ``meta``.
 _RESULT_IMAGE_KEYS = ("image_path", "screenshot_path")
+# A result that IS a declared image: its first non-blank line is exactly ``MEDIA:<path>``. That is
+# the marker a plugin tool (and the MCP renderer) uses to say "this call produced a picture", so it
+# is a declaration, not free text — a listing that merely mentions MEDIA: in prose never matches.
+MEDIA_PREFIX = "MEDIA:"
 # Tools whose image is what the call showed or made: (``args``/``result``, key). Nothing else's
 # args count: a ``path`` is just as often a write, a refused patch or a read that can't show it.
 _TOOL_IMAGE_FIELDS: dict[str, tuple[tuple[str, str], ...]] = {
     "vision_analyze": (("args", "image_url"),),
     "image_generate": (("result", "image"),),
 }
+
+
+def media_line_path(text: Any) -> str | None:
+    """*text* as a local image path when its first non-blank line is a bare ``MEDIA:<path>``."""
+    if not isinstance(text, str):
+        return None
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if not line.startswith(MEDIA_PREFIX):
+            return None
+        return local_image_path(line[len(MEDIA_PREFIX):].strip())
+    return None
 
 
 def tool_image_path(tool_name: str, args: Any, result: Any, *, is_error: bool) -> str | None:
@@ -371,6 +388,7 @@ def tool_image_path(tool_name: str, args: Any, result: Any, *, is_error: bool) -
     """
     if is_error:
         return None
+    declared = result
     if isinstance(result, str):
         from utils import safe_json_loads
 
@@ -382,7 +400,7 @@ def tool_image_path(tool_name: str, args: Any, result: Any, *, is_error: bool) -
         for candidate in (sources[source].get(key), meta.get(key) if source == "result" else None):
             if path := local_image_path(candidate):
                 return path
-    return None
+    return media_line_path(declared)
 
 
 @dataclass(frozen=True)

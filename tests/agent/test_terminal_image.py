@@ -133,6 +133,23 @@ def test_tool_image_path_reads_named_fields(tmp_path):
     assert tool_image_path("browser_exec", {}, envelope, is_error=False) == shot
 
 
+def test_tool_image_path_honours_a_declared_media_line(tmp_path):
+    """A plugin brush answers ``MEDIA:<path>``; that declares the picture, so the CLI draws it."""
+    shot = _png(tmp_path / "painting.png")
+    assert tool_image_path("illustrate", {"scene": "a hearth"}, f"MEDIA:{shot}", is_error=False) == shot
+    # The brush appends a note after a blank line; the first line still declares the image.
+    note = f"MEDIA:{shot}\n\nBrush note: no reference portrait matched 'x'."
+    assert tool_image_path("illustrate", {"scene": "a hearth"}, note, is_error=False) == shot
+    # A failed call is never a picture, and the marker must lead: prose that mentions it is text.
+    assert tool_image_path("illustrate", {}, f"MEDIA:{shot}", is_error=True) is None
+    assert tool_image_path("search_files", {}, f"Found these: MEDIA:{shot}", is_error=False) is None
+    # Only real local images count.
+    notes = tmp_path / "notes.txt"
+    notes.write_text("x")
+    assert tool_image_path("illustrate", {}, f"MEDIA:{notes}", is_error=False) is None
+    assert tool_image_path("illustrate", {}, f"MEDIA:{tmp_path / 'gone.png'}", is_error=False) is None
+
+
 def test_tool_image_path_ignores_listings_urls_and_missing_files(tmp_path):
     shot = _png(tmp_path / "shot.png")
     # A file listing names images in free text and nested lists: never a preview.

@@ -746,31 +746,15 @@ def _next_timeout_cooldown(compressor: Any, counter: str = "_consecutive_timeout
 
 _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
-# Summaries above ~10K tokens are themselves a context-pressure source, and on the
-# flash-lite aux route a 10K-token ask is not reliably reachable: a 181K-char prompt asking
-# for ~14K tokens returned finish_reason=length after 110s (OpenRouter route: Google AI
-# Studio, nominal cap 65535), which the caller treats as a failed summary and retries on the
-# main model for another ~2 minutes. 4K keeps the ask inside the range the model finishes
-# cleanly, and a summary that is meant to shrink context has no business being 10K tokens.
-_SUMMARY_TOKENS_CEILING = 4_000
+# Summaries above ~10K tokens are themselves a context-pressure source.
+_SUMMARY_TOKENS_CEILING = 10_000
 
 # After this many failures at one cursor, skip the exchange to avoid busy-looping.
 _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 
-# Prompt-side char cap on the serialized turn block (head+tail kept, see _bound_summary_input).
-# 600,000 chars covers a full middle window at a 300K threshold (measured: ~245,000 chars for a
-# 185K-token window, JSON-heavy tool results run ~1.3 chars per token), so the summariser is no
-# longer handed a sample and told nothing about the rest. It stays far inside the aux models'
-# 1M-token windows. Raising this trades prompt size for coverage only; nothing is dropped from
-# session history either way. NEVER add a max_tokens wire cap on the summary call.
-_SUMMARY_INPUT_MAX_CHARS = 600_000
-# Fewer records than this per part and the split costs more than it saves: each part gets less
-# context and the summary loses cross-part continuity for no wall-clock gain.
-_MIN_RECORDS_PER_CHUNK = 25
-# Sentinel for "use the compressor's own previous summary" in ``_build_summary_prompt``. Parallel
-# parts 2..N pass None explicitly: they never saw the earlier conversation, so asking them to merge
-# the whole previous summary into their slice would append three redundant copies of it.
-_SUMMARY_PREV_UNSET = object()
+# Prompt-side char cap on the serialized turn block (~40K tokens; head+tail kept,
+# see _bound_summary_input). NEVER add a max_tokens wire cap on the summary call.
+_SUMMARY_INPUT_MAX_CHARS = 160_000
 
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
@@ -2694,8 +2678,6 @@ class ContextCompressor(
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
-        # Parallel summary parts (1 = one call). Set from compression.summary_parallel_chunks.
-        self._summary_parallel_chunks = 1
         # Per-model context_length overrides live in custom_providers; without them deferred
         # resolution falls back to the hardcoded family catalog (#83324).
         self.custom_providers = custom_providers or None
@@ -3039,21 +3021,6 @@ class ContextCompressor(
         # Apply the floor in count-space: `max` in index-space would invert (smaller index = MORE protected).
         return min(boundary, len(result) - min_protect)
 
-    def _rendered_record_chars(self, msg: dict[str, Any]) -> int:
-        """Length of one serialized summary record, as the sampler measures it."""
-        return sum(len(r) for r in self._serialize_records_for_summary([msg]))
-
-    def _rendered_region_chars(self, result: list[dict[str, Any]], boundary: int) -> int:
-        """Length of the whole pre-tail region as the summariser will receive it.
-
-        Measured through ``_serialize_records_for_summary`` rather than raw content lengths: that
-        serializer clamps each message, redacts, and renders tool calls, so the only number that
-        predicts whether the sampler will elide anything is the one it produces.
-        """
-        if boundary <= 0:
-            return 0
-        return sum(len(r) for r in self._serialize_records_for_summary(result[:boundary]))
-
     @staticmethod
     def _dedupe_tool_results(result: list[dict[str, Any]]) -> int:
         """Pass 1: keep the newest copy of identical tool results, back-reference older ones."""
@@ -3177,18 +3144,10 @@ class ContextCompressor(
     def _prune_old_tool_results(
         self, messages: list[dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None, min_prune_chars: int = _PRUNE_MIN_CHARS,
-        summary_input_budget: int | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Project old tool-result bodies to bounded summaries without rewriting tool-call arguments.
         Returns ``(messages, count)``; token budget (when given) takes priority over the
-        message-count floor.
-
-        ``summary_input_budget`` (chars) converts this from "demote everything outside the tail" to
-        "demote the oldest of it only until the region the summariser reads fits". Passing None keeps
-        the historical behaviour, which is still what the live-proactive prune wants: there the point
-        is a smaller prompt, not a summariser with room to spare. Without the budget a 600K-char
-        summary window would be handed one-line stubs for 200 tool results it had room to read whole.
-        """
+        message-count floor."""
         if not messages:
             return messages, 0
         result = [m.copy() for m in messages]
@@ -3208,30 +3167,10 @@ class ContextCompressor(
         # Pass 2: summarize old tool results. Tool-call arguments are canonical execution
         # records and are never rewritten; summary input is bounded separately by
         # _render_tool_call_for_summary().
-        #
-        # Two reasons to demote, and they are different questions. With a summary-input budget the
-        # question is "does the summariser still fit this in", measured with the SAME serializer the
-        # summary input is built from, so a region reported as fitting is a region the sampler will
-        # not elide. Without a budget the historical rule stands: everything before the tail.
-        # Separately, a clarify result is always reduced to its descriptor: the raw payload carries
-        # the app's own "use your own judgment and continue" filler when nobody answered, and a
-        # summariser reading it verbatim turns an unanswered question into an assumed decision.
-        budgeted = bool(summary_input_budget and summary_input_budget > 0)
-        budget = int(summary_input_budget or 0)
-        always_demote = {
-            i for i in range(max(0, prune_boundary))
-            if call_id_to_tool.get(result[i].get("tool_call_id", ""), ("", ""))[0] == "clarify"
-        }
-        region_chars = self._rendered_region_chars(result, prune_boundary) if budgeted else 0
-        for i in range(max(0, prune_boundary)):
-            if budgeted and i not in always_demote and region_chars <= budget:
-                # The rest of the region fits as it is; nothing else needs demoting for size.
-                continue
-            before = self._rendered_record_chars(result[i]) if budgeted else 0
-            if self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills):
-                pruned += 1
-                if budgeted:
-                    region_chars += self._rendered_record_chars(result[i]) - before
+        pruned += sum(
+            self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills)
+            for i in range(max(0, prune_boundary))
+        )
         # Pass 3: retire image payloads inside the protected tail; re-sent embeds otherwise make
         # compression look ineffective and trip anti-thrash. Newest frames stay live.
         # Newest frames stay live for follow-up QA; unread spared results stay live too. See #92699.
@@ -3326,8 +3265,6 @@ class ContextCompressor(
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
     # Aggregate cap applied after per-message limits; class alias so subclasses/tests can override.
     _SUMMARY_INPUT_MAX_CHARS = _SUMMARY_INPUT_MAX_CHARS
-    # Parallel summary parts (1 = one summariser call). Set from compression.summary_parallel_chunks.
-    _summary_parallel_chunks = 1
 
     def _render_tool_args_for_summary(self, arguments: str) -> str:
         """Redacted, capped tool-call arguments for the summarizer."""
@@ -3650,122 +3587,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             )
         return content
 
-    def _summary_request_messages(
-        self, turns: list[dict[str, Any]], summary_budget: int, focus_topic: Optional[str],
-        memory_context: str, *, has_user_turn: bool, include_previous_summary: bool = True,
-    ) -> list[dict[str, str]]:
-        """Build the summariser request for one slice of turns (lean sampling, typed roles)."""
-        # Lean mode even-samples oversized input (one bounded request, never a second).
-        typed_turns: list = []
-        if getattr(self, "tail_mode", "lean") == "lean":
-            records = self._serialize_records_for_summary(turns)
-            slices: list = []
-            content_to_summarize, coverage = self._sample_summary_records(records, slices)
-            self._record_summary_input_coverage(coverage)
-            # Typed turns (#146750): user, assistant tool_calls and tool output each keep their real role.
-            # Typed rows (async-delegation results, notices; not /steer) and flagged nudges are not user input.
-            typed_turns = typed_summary_messages(
-                turns, records, slices,
-                lambda m: self._is_real_user_turn(m) and not is_user_role_scaffolding(m),
-                self._render_tool_args_for_summary,
-            )
-            content_to_summarize = TYPED_TURNS_POINTER
-        else:
-            content_to_summarize = self._bound_summary_input(self._serialize_for_summary(turns))
-        messages = self._build_summary_prompt(
-            content_to_summarize, summary_budget, focus_topic, memory_context, has_user_turn,
-            previous_summary=_SUMMARY_PREV_UNSET if include_previous_summary else None,
-        )
-        messages[1:1] = typed_turns
-        return messages
-
-    def _split_turns_for_summary(self, turns: Optional[list[dict[str, Any]]]) -> Optional[list[list[dict[str, Any]]]]:
-        """Split the turns into contiguous parts for concurrent summarisation, or None.
-
-        Opt-in via ``compression.summary_parallel_chunks`` (default 1). A part never ends between an
-        assistant tool call and the tool result that answers it: a cut is only made before a message
-        whose role is not ``tool``, so every tool call travels with its result and nothing is lost or
-        orphaned. Parts are joined back in order, so the summary still reads as one document. Below
-        ``_MIN_RECORDS_PER_CHUNK`` messages per part the split is a no-op: three tiny calls cost more,
-        and carry less context each, than one.
-        """
-        count = getattr(self, "_summary_parallel_chunks", 1)
-        if not isinstance(count, int) or isinstance(count, bool) or count < 2:
-            return None
-        if not turns or len(turns) < count * _MIN_RECORDS_PER_CHUNK:
-            return None
-        total = sum(len(str(m.get("content") or "")) for m in turns)
-        target = max(1, total // count)
-        parts: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
-        size = 0
-        for msg in turns:
-            # Never open a part with a tool result: it belongs to the assistant message before it.
-            if (
-                msg.get("role") != "tool"
-                and size >= target
-                and len(parts) < count - 1
-                and current
-            ):
-                parts.append(current)
-                current, size = [], 0
-            current.append(msg)
-            size += len(str(msg.get("content") or ""))
-        if current:
-            parts.append(current)
-        if len(parts) < 2 or any(len(p) < _MIN_RECORDS_PER_CHUNK for p in parts[:-1]):
-            return None
-        return parts
-
-    def _call_summary_llm_parallel(
-        self, parts: list[list[dict[str, Any]]], summary_budget: int, focus_topic: Optional[str],
-        memory_context: str,
-    ) -> str:
-        """Summarise the parts concurrently and join them in order.
-
-        Each part goes through the same request builder and ``_call_summary_llm`` the single-call path
-        uses, so routing, validation, truncation detection, interrupt shielding and the cooldown/failure
-        machinery are identical. A truncated or empty part raises, which routes the whole summary
-        through the existing fallback path rather than committing a half-summary.
-        """
-        count = len(parts)
-        per_part_budget = max(800, summary_budget // count)
-        results: list[Optional[str]] = [None] * count
-        started = time.monotonic()
-
-        def _summarise(index: int, part: list[dict[str, Any]]) -> None:
-            part_has_user = any(
-                self._is_real_user_turn(m) and not is_user_role_scaffolding(m) for m in part
-            )
-            messages = self._summary_request_messages(
-                part, per_part_budget, focus_topic, memory_context, has_user_turn=part_has_user,
-                # Only part 1 carries the previous summary: it is the part that continues it.
-                include_previous_summary=(index == 0),
-            )
-            banner = (
-                f"This is part {index + 1} of {count} of ONE conversation, split for length. "
-                "Summarise only what this part contains, in the usual structure. Do not mention "
-                "the split, do not summarise the other parts, and leave no trailing 'to be continued'."
-            )
-            messages[0] = {
-                **messages[0],
-                "content": banner + "\n\n" + str(messages[0].get("content") or ""),
-            }
-            results[index] = self._call_summary_llm(messages, started)
-
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=count, thread_name_prefix="sumsummary") as pool:
-            futures = [pool.submit(_summarise, i, part) for i, part in enumerate(parts)]
-            for future in futures:
-                future.result()
-        filled = [r for r in results if r]
-        if len(filled) != count:
-            raise RuntimeError(
-                f"Parallel summary produced {len(filled)} of {count} parts; refusing a partial summary"
-            )
-        return "\n\n".join(f"### Part {i + 1} of {count}\n{results[i]}" for i in range(count))
-
     def _generate_summary(
         self, turns_to_summarize: list[dict[str, Any]], focus_topic: Optional[str] = None,
         memory_context: str = "", bypass_cooldown: bool = False,
@@ -3793,32 +3614,30 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         _pruned_skill_names = list(dict.fromkeys(
             _collect_ghosted_skill_names(turns_to_summarize) + _extract_pruned_skill_names(self._previous_summary or "")
         ))[:_MAX_PRUNED_SKILL_MARKERS]
-        # Parallel chunks (opt-in): the summary call is the whole cost of a compaction and it is one
-        # request's wall clock. Measured 2026-11-05 on a real 388,738-char window: 12.6s as one call,
-        # 5.6s as three concurrent calls at the same total output budget.
-        parts = self._split_turns_for_summary(turns_to_summarize)
-        # Telemetry: how many summariser calls this compaction actually used (1 unless chunked).
-        self._last_summary_chunk_count = len(parts) if parts else 1
-        if parts:
-            has_user_turn = any(
-                self._is_real_user_turn(m) and not is_user_role_scaffolding(m)
-                for part in parts for m in part
+        # Lean mode even-samples oversized input (one bounded request, never a second).
+        if getattr(self, "tail_mode", "lean") == "lean":
+            records = self._serialize_records_for_summary(turns_to_summarize)
+            slices: list = []
+            content_to_summarize, coverage = self._sample_summary_records(records, slices)
+            self._record_summary_input_coverage(coverage)
+            # Typed turns (#146750): user, assistant tool_calls and tool output each keep their real role.
+            # Typed rows (async-delegation results, notices; not /steer) and flagged nudges are not user input.
+            typed_turns = typed_summary_messages(
+                turns_to_summarize, records, slices,
+                lambda m: self._is_real_user_turn(m) and not is_user_role_scaffolding(m),
+                self._render_tool_args_for_summary,
             )
+            content_to_summarize = TYPED_TURNS_POINTER
         else:
-            has_user_turn = getattr(self, "_summary_has_user_turn", None)
-            if has_user_turn is None:
-                has_user_turn = self._transcript_has_real_user_turn(turns_to_summarize)
+            typed_turns = []
+            content_to_summarize = self._bound_summary_input(self._serialize_for_summary(turns_to_summarize))
+        has_user_turn = getattr(self, "_summary_has_user_turn", None)
+        if has_user_turn is None:
+            has_user_turn = self._transcript_has_real_user_turn(turns_to_summarize)
+        messages = self._build_summary_prompt(content_to_summarize, summary_budget, focus_topic, memory_context, has_user_turn)
+        messages[1:1] = typed_turns
         try:
-            if parts:
-                content = self._call_summary_llm_parallel(
-                    parts, summary_budget, focus_topic, memory_context,
-                )
-            else:
-                messages = self._summary_request_messages(
-                    turns_to_summarize, summary_budget, focus_topic, memory_context,
-                    has_user_turn=has_user_turn,
-                )
-                content = self._call_summary_llm(messages, prompt_started_at)
+            content = self._call_summary_llm(messages, prompt_started_at)
             # Strip <think> blocks: they would be stored, injected, and compounded on every iterative update.
             from agent.agent_runtime_helpers import strip_think_blocks
             content = strip_think_blocks(None, content).strip() or content
@@ -3855,7 +3674,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
     def _build_summary_prompt(
         self, content_to_summarize: str, summary_budget: int, focus_topic: Optional[str],
-        memory_context: str, has_user_turn: bool, previous_summary: Any = _SUMMARY_PREV_UNSET,
+        memory_context: str, has_user_turn: bool,
     ) -> list[dict[str, str]]:
         """Assemble the summarizer request (fresh or iterative-update form) as ``[system, user]``.
 
@@ -3884,10 +3703,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # Lean mode folds the session log into this SAME single request (one aux call).
         _session_log_section = _LEAN_SESSION_LOG_SECTION if getattr(self, "tail_mode", "lean") == "lean" else ""
         _template_sections = self._summary_template_sections(_section, summary_budget, _session_log_section)
-        _previous = self._previous_summary if previous_summary is _SUMMARY_PREV_UNSET else previous_summary
-        if _previous:
+        if self._previous_summary:
             # Iterative update. Bound the previous summary too: a rehydrated handoff can be huge.
-            _bounded_previous_summary = self._bound_summary_input(_previous)
+            _bounded_previous_summary = self._bound_summary_input(self._previous_summary)
             instructions = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
@@ -3939,14 +3757,6 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _summary_template_sections(cls, _section: dict[str, str], summary_budget: int, _session_log_section: str) -> str:
         """The ``## ...`` section template shared by the fresh and iterative-update prompts."""
         _temporal_anchoring_rule = cls._temporal_anchoring_rule()
-        _target_tokens = summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)
-        # A token "target" is not a bound. Told to be concrete about a 140K-char log of tool
-        # output, the summariser writes until the provider's output cap and the call returns
-        # finish_reason=length: observed 65K output tokens over 103s, then a full retry on the
-        # main model, which cost another 128s. Words are countable in generation in a way tokens
-        # are not, so the ceiling is stated in words, at 0.6 words-per-token headroom under the
-        # token target, and it is stated as a ceiling rather than as another target.
-        _max_words = max(150, int(_target_tokens * 0.6))
         return f"""{HISTORICAL_TASK_HEADING}
 {_section["historical_task"]}
 
@@ -3999,7 +3809,7 @@ repeat each one verbatim here — copy the exact text, do NOT paraphrase, summar
 or describe them. These markers tell the agent which skills must be reloaded before
 use. If none appear, omit this section entirely.]
 
-Target ~{_target_tokens} tokens. HARD CEILING: at most {_max_words} words in total, across every section. Stop at the ceiling rather than exceed it — an unfinished final section is better than an overrun. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
@@ -4052,22 +3862,6 @@ Write only the summary body. Do not include any preamble or prefix."""
             self.summary_model or getattr(self, "_last_aux_resolved_model", "") or ""
         ).strip()
         if _route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
-            # The configured per-task chain gets the failed summary before the main model does: a
-            # capacity failure on a flash-class summariser belongs on the next summariser, not on a
-            # replay that costs minutes. Only when the chain is absent or exhausted does the main
-            # model take it.
-            _chain_entry = self._configured_summary_fallback(_route_model)
-            if _chain_entry is not None:
-                logger.warning(
-                    "Summary model '%s' %s (%s). Retrying on the configured compression fallback '%s'.",
-                    _route_model, kind.fallback_reason(), e, _chain_entry.get("model"),
-                )
-                telemetry = getattr(self, "_active_compression_telemetry", None)
-                if isinstance(telemetry, dict):
-                    telemetry["summary_fallback_model"] = _chain_entry.get("model")
-                self.summary_model = str(_chain_entry.get("model") or "")
-                self._clear_compression_failure_cooldown()
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
             self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
             # Retry immediately on the main model.
             return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
@@ -5340,10 +5134,6 @@ Write only the summary body. Do not include any preamble or prefix."""
             summary = self._fallback_summary_for_window(
                 telemetry, turns_to_summarize, compress_end - compress_start, feasibility_skip,
             )
-        # Chunked summarisation is opt-in and invisible in the summary itself; record how many
-        # concurrent parts produced it so a live run can be observed rather than assumed.
-        if telemetry.get("chunk_count") == 1:
-            telemetry["chunk_count"] = max(1, int(getattr(self, "_last_summary_chunk_count", 1) or 1))
         # Phase 4: the summary exists, so archive what the compaction drops or shortens, then assemble.
         messages, pruned_count = self._commit_window(canonical_messages, plan, pruned_count, compress_start, compress_end)
         compressed = self._assemble_with_archive_list(messages, compress_start, compress_end, scan, summary)
