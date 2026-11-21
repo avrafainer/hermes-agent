@@ -1388,6 +1388,19 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                # Execution authority is inherited, never invented. A child of an
+                # authorised card carries the parent's grant (and therefore its
+                # actions, expiry and single spending allowance); a child of an
+                # ungranted card is created ungranted and cannot be dispatched.
+                # Fan-out, depth and concurrency are enforced here, before the row
+                # exists in a runnable state, so a decomposer cannot multiply work
+                # past what the parent was allowed.
+                try:
+                    from hermes_cli import authority as _authority
+                    _parent = creator_task_id or (next(iter(parents)) if parents else None)
+                    _authority.bind_child(conn, task_id, _parent)
+                except Exception:
+                    pass
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -1520,6 +1533,21 @@ def list_tasks(
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
+    # Reassigning is delegation, and delegation is how a card reaches a profile that
+    # can do something the creator could not. Checked only when the assignee actually
+    # changes, so ordinary bookkeeping on an already-assigned card is unaffected.
+    try:
+        _current = conn.execute("SELECT assignee FROM tasks WHERE id = ?",
+                                (task_id,)).fetchone()
+        if _current is not None and _current[0] != profile:
+            from hermes_cli import authority as _authority
+            _verdict, _why = _authority.check(task_id, "delegate", profile=profile)
+            if _verdict != "allow":
+                _append_event(conn, task_id, "delegate_refused_unauthorized",
+                              {"reason": _why, "to": profile})
+                return False
+    except Exception:
+        pass
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -2708,6 +2736,28 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _authority_completion_check(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Completing a parent promotes its children, so it is an execution act.
+
+    Returns a refusal reason, or None when the completion may proceed. A card with no
+    children is bookkeeping and is never blocked; a card with children needs
+    `complete_with_children` on its grant.
+    """
+    n = conn.execute("SELECT count(*) FROM task_links WHERE parent_id = ?",
+                     (task_id,)).fetchone()[0]
+    if not n:
+        return None
+    try:
+        from hermes_cli import authority as _authority
+        verdict, why = _authority.check(task_id, "complete_with_children", profile=None)
+    except Exception:
+        return None
+    if verdict == "allow":
+        return None
+    return f"no authority to complete a card with {n} child task(s): {why}"
+
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2731,6 +2781,11 @@ def complete_task(
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
     """
+    _auth_refusal = _authority_completion_check(conn, task_id)
+    if _auth_refusal:
+        _append_event(conn, task_id, "complete_refused_unauthorized",
+                      {"reason": _auth_refusal})
+        raise PermissionError(_auth_refusal)
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -3482,6 +3537,11 @@ def request_changes(
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
     gating reapplied. Returns ``(ok, implementer | reason)``."""
+    _auth_refusal = _authority_completion_check(conn, task_id)
+    if _auth_refusal:
+        _append_event(conn, task_id, "review_refused_unauthorized",
+                      {"reason": _auth_refusal})
+        return (False, _auth_refusal) if with_reason else False
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3563,6 +3623,18 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
+    # Promotion is the transition that turns a proposal into dispatchable work, so it
+    # is checked here and not only at dispatch: an operator or agent asking to promote
+    # a card with no grant must be told no, not have the card sit in `ready` until the
+    # gate refuses it on the next tick.
+    try:
+        from hermes_cli import authority as _authority
+        _verdict, _why = _authority.check(task_id, "promote", profile=None)
+    except Exception:
+        _verdict, _why = "allow", "authority module unavailable"
+    if _verdict != "allow":
+        return False, f"no authority to promote: {_why}"
+
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
     # first claim silently reverts (#106195). The dependency itself is the knob.
@@ -3628,6 +3700,17 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
+    # Unblocking is one of the two ways a parked card becomes runnable again, so it is
+    # gated like promotion. Refused cards stay blocked and say why, rather than
+    # silently resuming into execution on the next tick.
+    try:
+        from hermes_cli import authority as _authority
+        _verdict, _why = _authority.check(task_id, "unblock", profile=None)
+    except Exception:
+        _verdict, _why = "allow", "authority module unavailable"
+    if _verdict != "allow":
+        _append_event(conn, task_id, "unblock_refused_unauthorized", {"reason": _why})
+        return False
     now = int(time.time())
     with write_txn(conn):
         resume_status = (

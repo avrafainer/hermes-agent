@@ -1828,7 +1828,18 @@ DEFAULT_CONFIG = {
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
-    "kanban": {
+        "authority": {
+        # Execution authority. off = no checks (default), shadow = compute and log
+        # every verdict without blocking, enforce = honour it. See hermes_cli/authority.py.
+        "mode": "off",
+        "fanout": 6,
+        "depth": 4,
+        "concurrency": 3,
+        # Wrap worker spawns in an OS sandbox that denies read access to the grant
+        # store and its signing key. Requires macOS seatbelt (sandbox-exec).
+        "sandbox_workers": False,
+    },
+"kanban": {
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.

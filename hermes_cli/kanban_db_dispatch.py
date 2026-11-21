@@ -150,6 +150,10 @@ class DispatchResult:
     """``(task_id, reason)`` refused before any claim or subprocess because the
     unattended spend lane is spent. Nothing ran, so no retry budget is touched;
     the card stays queued and is picked up once the lane has room."""
+    skipped_unauthorized: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` refused before any claim because the card resolves to no
+    unrevoked, unexpired grant holding ``dispatch``. Distinct from the spend bucket:
+    an unauthorised card does not resume when a budget refills."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
@@ -2091,11 +2095,55 @@ def dispatch_once(
     return result
 
 
+def _authority_gate():
+    """Late import: keeps the dispatcher importable when the authority module is absent."""
+    from hermes_cli import authority
+
+    return authority
+
+
 def _spend_gate():
     """Late import: keeps the dispatcher importable when the guard is absent."""
     from hermes_cli import spend_gate
 
     return spend_gate
+
+
+def _authority_sandbox(cmd, env, task):
+    """Wrap a worker spawn in the authority sandbox, or refuse to spawn it.
+
+    Returns ``(cmd, env, error)``. ``error`` is a reason string and means the caller must
+    NOT spawn: when `authority.sandbox_workers` is on, an unattended worker that cannot be
+    isolated is exactly the process the whole design exists to prevent, so it fails closed
+    here rather than running unconfined. The signing key is stripped from the environment
+    unconditionally, sandbox or not, so a worker cannot inherit it through the env.
+    """
+    env.pop("HERMES_AUTHORITY_KEY", None)
+    for leaked in ("HERMES_AUTHORITY_DB", "HERMES_STATE_DB"):
+        env.pop(leaked, None)
+    try:
+        from hermes_cli import authority as _auth
+        cfg = _auth.settings()
+    except Exception:
+        return cmd, env, None
+    if not cfg.get("sandbox_workers"):
+        return cmd, env, None
+    import shutil as _shutil
+    import sys as _sys
+    sandbox = "/usr/bin/sandbox-exec"
+    if _sys.platform != "darwin" or not os.path.exists(sandbox):
+        return cmd, env, ("authority: sandbox_workers is on but sandbox-exec is "
+                          "unavailable on this host")
+    ok, why = _auth.sandbox_selftest()
+    if not ok:
+        return cmd, env, f"authority: sandbox self-test failed ({why})"
+    prof_path = _auth._home() / "state" / "worker.sandbox"
+    try:
+        prof_path.parent.mkdir(parents=True, exist_ok=True)
+        prof_path.write_text(_auth.sandbox_profile())
+    except OSError as exc:
+        return cmd, env, f"authority: cannot write sandbox profile ({exc})"
+    return [sandbox, "-f", str(prof_path), *cmd], env, None
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
@@ -2437,6 +2485,28 @@ def _dispatch_lane_task(
                                       {"reason": spend_reason})
         _kb._log.warning("kanban dispatcher: %s held back, spend lane is spent: %s",
                          task_id, spend_reason)
+        return False
+    # Authority at the spawn boundary. This is the last line and the one that covers
+    # every creation path: a card can arrive in `ready` via the tool, the CLI, the web
+    # API, a cron script, the decomposer or a direct write, and none of those is
+    # trusted here. The card must resolve to a grant that is unrevoked, unexpired and
+    # still holds `dispatch`; otherwise nothing is claimed and the retry budget is
+    # untouched. Off/shadow behaviour is decided inside the module, not here.
+    auth_verdict, auth_reason = _authority_gate().check(
+        task_id, "dispatch", profile=assignee)
+    if auth_verdict != "allow":
+        result.skipped_unauthorized.append((task_id, auth_reason))
+        if not dry_run:
+            with _kb.write_txn(conn):
+                last = conn.execute(
+                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                if (last is None or last["kind"] != "spawn_refused_unauthorized"
+                        or last["payload"] != _kb._json_or_null({"reason": auth_reason})):
+                    _kb._append_event(conn, task_id, "spawn_refused_unauthorized",
+                                      {"reason": auth_reason})
+        _kb._log.warning("kanban dispatcher: %s refused, no execution authority: %s",
+                         task_id, auth_reason)
         return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
@@ -3154,6 +3224,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     cmd = _restart_safe_worker_argv(task, cmd)
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
+    cmd, env, _auth_error = _authority_sandbox(cmd, env, task)
+    if _auth_error:
+        raise RuntimeError(_auth_error)
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(
