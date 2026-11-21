@@ -48,3 +48,34 @@ def test_refusals_still_refuse(text: str, scope: str, reason: str) -> None:
     ok, why = assess(text, scope)
     assert ok is False
     assert why == reason
+
+
+# ---------------------------------------------------------------------------
+# A bare imperative answers the message before it.
+# ---------------------------------------------------------------------------
+
+def _seed(tmp_path, assistant_text: str, user_text: str = "fix it") -> tuple[str, str]:
+    """A minimal state.db with one assistant turn followed by one user turn."""
+    import sqlite3
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("create table messages (id integer primary key, session_id text, role text, "
+                "content text, timestamp real)")
+    con.execute("insert into messages values (1, 's', 'assistant', ?, 1.0)", (assistant_text,))
+    con.execute("insert into messages values (2, 's', 'user', ?, 2.0)", (user_text,))
+    con.commit(); con.close()
+    return str(db), "s"
+
+
+def test_bare_imperative_is_resolved_by_the_offer_it_answers(tmp_path, monkeypatch):
+    from hermes_cli.authority import _antecedent_is_a_reply
+    db, session = _seed(tmp_path, "The check exits 1 every hour. Want me to fix it?")
+    monkeypatch.setenv("HERMES_STATE_DB", db)
+    assert _antecedent_is_a_reply("2", session)
+
+
+def test_bare_imperative_with_nothing_to_answer_stays_ambiguous(tmp_path, monkeypatch):
+    from hermes_cli.authority import _antecedent_is_a_reply
+    db, session = _seed(tmp_path, "Here is what I found. The file has 400 lines.")
+    monkeypatch.setenv("HERMES_STATE_DB", db)
+    assert _antecedent_is_a_reply("2", session) == ""

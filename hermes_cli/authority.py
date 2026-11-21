@@ -239,6 +239,12 @@ _PERFORMATIVE = r"\b(i (authori[sz]e[ds]?|approve[ds]?|confirm(ed)?|want|need)|i
 # Only the remainder decides — "No, don't do that" keeps its negation.
 _CORRECTIVE = r"^\W*no\b[\s,:;-]+(.+)$"
 _CORRECTIVE_AS_DIRECTIVE = r"\b(should|must|needs? to|has to|have to|expect|meant|supposed)\b"
+# Shapes that make the NEXT user message an answer rather than a stray fragment: a question
+# mark, an explicit offer, or a named next step. Used only to resolve an ambiguous bare
+# imperative, never to promote narration.
+_OFFER_TAIL = re.compile(
+    r"(\?|\b(want me to|shall i|should i|would you like|do you want|i suggest|i recommend|"
+    r"the fix|the next fix|next step|options?:)\b)", re.I)
 _HYPOTHETICAL = r"\b(what if|if we|would|could|might|suppose|imagine|maybe|perhaps|whether|consider)\b"
 GRANT_ID_RE = re.compile(r"^g_[0-9a-f]{16}$")
 _NEGATION = r"(\bnot\b|n't\b|\bnever\b|\bno\b|\bstop\b|\bhold off\b|\bcancel\b)"
@@ -317,6 +323,36 @@ def _affirmative(text: str, scope_cite: str = "") -> tuple[bool, str]:
     return (True, "") if ok else (False, why)
 
 
+def _antecedent_is_a_reply(message_id: str, session_id: str) -> str:
+    """The assistant message this user message answers, or "" if it answers nothing.
+
+    A bare imperative — "fix it", "do it" — carries no referent of its own and is classed
+    ambiguous, which is correct in isolation and wrong in a conversation: it was the direct
+    answer to something just asked. Resolve it only when the immediately preceding assistant
+    message was an offer or a question. Anything else stays ambiguous, so a stray fragment
+    cannot authorise work.
+    """
+    state = pathlib.Path(os.environ.get("HERMES_STATE_DB") or _home() / "state.db")
+    try:
+        con = sqlite3.connect(f"file:{state}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(str(state))
+        con.execute("pragma query_only=1")
+    try:
+        row = con.execute(
+            "select content from messages where session_id=? and role='assistant' and id<? "
+            "order by id desc limit 1", (session_id, message_id)).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        con.close()
+    body = " ".join((row[0] or "").split()) if row else ""
+    if not body:
+        return ""
+    tail = body[-1200:]
+    return tail if _OFFER_TAIL.search(tail) else ""
+
+
 def mint(*, message_id: str, session_id: str, scope_cite: str,
          actions: Iterable[str], project: Optional[str] = None,
          item_scope: Optional[str] = None, spend_limit: Optional[float] = None,
@@ -340,6 +376,12 @@ def mint(*, message_id: str, session_id: str, scope_cite: str,
         raise MintRefused(f"quoted scope is not present in message {message_id}")
     if require_affirmative:
         ok, why = assess(text, scope_cite)
+        if not ok and why.startswith("ambiguous"):
+            # A bare imperative answers the message before it. Only an offer or a question
+            # can be answered that way, so "fix it" following a proposal is authorisation
+            # while "fix it" out of nowhere is not.
+            if _antecedent_is_a_reply(message_id, session_id):
+                ok, why = True, ""
         if not ok:
             raise MintRefused(f"message {message_id} is not affirmative: {why}")
 
