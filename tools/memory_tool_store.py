@@ -130,6 +130,55 @@ def _over_limit(new_total: int, limit: int) -> str:
     return f"would put memory at {new_total:,}/{limit:,} chars: free at least {new_total - limit:,} chars"
 
 
+# --- capacity-aware spill ---------------------------------------------------------------
+# Detail used to accumulate in memory until an add was refused, and the refusal told the
+# model to *delete* entries to make room. That is how real content disappeared. The fix
+# is not a bigger budget: it is that detail which outgrows memory has a durable home, and
+# memory keeps a pointer to it.
+
+# Entries holding the core identity/operating blocks are never moved automatically. They are
+# the part of memory that has to be present in every session.
+_PROTECTED_MARKERS = (
+    "# USER - Avra", "# MEMORY - how this system", "## Identity", "## Voice",
+    "## How to work with her", "## Health", "## People", "## Work", "## Money",
+)
+_SPILL_MIN_CHARS = 300          # below this an entry is a standing fact, not accumulated detail
+_SPILL_MIN_GAIN = 120           # pointless churn otherwise: a pointer that saves nothing is noise
+_SPILL_DIR = ("state", "references", "memory-spill")
+
+
+def _is_protected(entry: str) -> bool:
+    head = entry.strip()[:200]
+    return any(marker in head for marker in _PROTECTED_MARKERS)
+
+
+def _spill_root() -> Path:
+    """Shared root, even from a profile: spilled detail is organization-wide."""
+    from tools import memory_tool
+    root = memory_tool.get_memory_dir().parent
+    if root.name == "memories":
+        root = root.parent
+    if root.parent.name == "profiles":
+        root = root.parent.parent
+    return root
+
+
+def _pointer_for(entry: str, ref_name: str) -> str:
+    # Kept deliberately short: the pointer must cost far less than the entry it replaces,
+    # or spilling frees nothing and the write still fails.
+    preview = " ".join(entry.split())[:70]
+    return (f"{preview}... [full text: state/references/memory-spill/{ref_name}.md]")
+
+
+def _is_spilled_pointer(entry: str) -> bool:
+    return "state/references/memory-spill/" in entry
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+
 # Patch content cannot be empty, and 'remove' would drop the sibling facts in the entry.
 PATCH_DROP_HINT = "To drop text inside an entry, patch a longer span that contains it; 'remove' deletes the whole entry."
 
@@ -329,15 +378,39 @@ class MemoryStore:
         return self._consolidation_failure(
             _error(message, "over_budget", current_entries=self._entries_for(target), usage=self._usage(target)))
 
+    def _preserve_refused(self, target: str, content: str) -> str:
+        """A write that cannot be made must still not lose its text. Park it beside the record."""
+        if not content or len(content) < 40:
+            return ""
+        try:
+            import datetime
+            from hermes_constants import mkdir_under_hermes_home
+            ref_dir = _spill_root().joinpath(*_SPILL_DIR)
+            mkdir_under_hermes_home(ref_dir)
+            ref = ref_dir / f"refused-{target}-{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}.md"
+            ref.write_text("# Memory write refused at capacity\n\n"
+                           "This text could not be written to memory because nothing could be moved "
+                           "to make room. It was not dropped; merge it into memory or a reference.\n\n"
+                           f"{content}\n", encoding="utf-8")
+            if _norm(content) not in _norm(ref.read_text(encoding="utf-8")):
+                return ""
+            return str(ref.relative_to(_spill_root()))
+        except Exception as exc:
+            logger.warning("could not preserve refused memory write: %s", exc)
+            return ""
+
     def _add_overflow(self, target: str, content: str, limit: int) -> dict[str, Any]:
         """A lone add over budget, legacy or one-item batch: the model has not consolidated yet,
         so the live entries come back (its prompt snapshot may predate other sessions' writes)."""
         over = len(ENTRY_DELIMITER.join(self._entries_for(target) + [content])) - limit
+        parked = self._preserve_refused(target, content)
+        tail = (f" Its text was preserved at {parked} so nothing is lost; merge it from there."
+                if parked else "")
         return self._failure_with_entries(target, (
             f"Memory at {self._char_count(target):,}/{limit:,} chars; adding this entry ({len(content)} chars) "
             f"would exceed the limit by {over:,} chars. Retry as ONE 'operations' batch that "
             f"removes or shortens (patch) stale entries from current_entries below to free at least "
-            f"{over:,} chars AND adds this entry — the limit is checked only on the batch result."))
+            f"{over:,} chars AND adds this entry — the limit is checked only on the batch result." + tail))
 
     def _batch_failure(self, target: str, message: str, failure_class: str,
                        closest_entries: Optional[list[str]] = None) -> dict[str, Any]:
@@ -400,6 +473,70 @@ class MemoryStore:
             self._write_file(path, result[0])
             return self._success_response(target, result[1], **extra_fields)
 
+    def _spill_to_fit(self, target: str, entries: list[str], needed: int) -> tuple[Optional[list[str]], str]:
+        """Move accumulated detail into a durable reference until ``needed`` chars are free.
+
+        Returns ``(new_entries, note)`` when something was moved; ``(None, "")`` when nothing
+        eligible could be moved (short entries and the protected identity blocks stay put).
+        The reference file is written first and verified by re-reading it; if the text is not
+        there, nothing is changed and the caller falls back to reporting the budget.
+        """
+        import datetime
+        from hermes_constants import mkdir_under_hermes_home
+
+        eligible = [(i, e) for i, e in enumerate(entries)
+                    if len(e) >= _SPILL_MIN_CHARS and not _is_protected(e)]
+        if not eligible:
+            return None, ""
+        eligible.sort(key=lambda pair: len(pair[1]), reverse=True)
+
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        ref_dir = _spill_root().joinpath(*_SPILL_DIR)
+        ref = ref_dir / f"{self._path_for(target).stem}-{stamp}.md"
+
+        moved: list[tuple[int, str, str]] = []
+        freed = 0
+        for idx, entry in eligible:
+            if freed >= needed:
+                break
+            pointer = _pointer_for(entry, ref.stem)
+            gain = len(entry) - len(pointer)
+            if gain < _SPILL_MIN_GAIN:
+                continue
+            moved.append((idx, entry, pointer))
+            freed += gain
+        if not moved:
+            return None, ""
+
+        try:
+            mkdir_under_hermes_home(ref_dir)
+            header = ("# Memory spilled at capacity\n\n"
+                      "These entries were moved verbatim out of "
+                      f"{self._path_for(target).name} when it reached its character limit. Nothing "
+                      "was edited, shortened or deleted: this is the original text, in order.\n\n")
+            with ref.open("a", encoding="utf-8") as fh:
+                if ref.stat().st_size == 0:
+                    fh.write(header)
+                for _idx, entry, _pointer in moved:
+                    fh.write(f"## entry\n\n{entry}\n\n")
+            written = ref.read_text(encoding="utf-8")
+            if any(_norm(entry) not in _norm(written) for _e_idx, entry, _p in moved):
+                logger.error("memory spill verification failed for %s; memory left unchanged", ref)
+                return None, ""
+        except Exception as exc:  # never lose the write because the spill file failed
+            logger.warning("memory spill to %s failed: %s", ref, exc)
+            return None, ""
+
+        new_entries = list(entries)
+        for idx, _entry, pointer in moved:
+            new_entries[idx] = pointer
+        if not moved:
+            return None, ""
+        note = (f"Moved {len(moved)} long entr{'y' if len(moved) == 1 else 'ies'} verbatim to "
+                f"{ref.relative_to(_spill_root())} (verified) to make room. The entries above the "
+                f"pointers still work; read that file when their detail matters.")
+        return new_entries, note
+
     def add(self, target: str, content: str) -> dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -412,6 +549,10 @@ class MemoryStore:
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
             if len(ENTRY_DELIMITER.join(entries + [content])) > limit:
+                over = len(ENTRY_DELIMITER.join(entries + [content])) - limit
+                spilled, note = self._spill_to_fit(target, entries, over)
+                if spilled is not None and len(ENTRY_DELIMITER.join(spilled + [content])) <= limit:
+                    return spilled + [content], f"Entry added. {note}"
                 return self._add_overflow(target, content, limit)
             return entries + [content], "Entry added."
         # Append-only: skip the drift guard (appending never clobbers foreign
@@ -627,6 +768,19 @@ class MemoryStore:
             grows = not (all(op.get("action") == "remove" for op in ops)
                          or (len(ops) == 1 and working == entries))
             if grows and new_total > limit:
+                over = new_total - limit
+                spilled, note = self._spill_to_fit(target, entries, over)
+                if spilled is not None:
+                    if len(ops) == 1 and ops[0].get("action") == "add":
+                        content = (ops[0].get("content") or ops[0].get("new_text") or "").strip()
+                        if content and len(ENTRY_DELIMITER.join(spilled + [content])) <= limit:
+                            return spilled + [content], f"Entry added. {note}"
+                    # Multi-op: commit the spill alone and ask for the batch again. Losing the
+                    # free-text detail here is the one thing that must not happen; the model
+                    # still holds its own operations and can resend them into the new room.
+                    if len(ENTRY_DELIMITER.join(spilled)) <= limit:
+                        return spilled, (f"Memory was at capacity: {note} Your {len(operations)} "
+                                        f"operations were NOT applied - resend the same batch now.")
                 if len(ops) == 1 and ops[0].get("action") == "add":  # the advertised single add
                     return self._add_overflow(target, (ops[0].get("content") or ops[0].get("new_text") or "").strip(), limit)
                 return self._batch_failure(target, (

@@ -163,8 +163,11 @@ class TestMemoryStoreAdd:
 
 
     def test_overflow_returns_consolidation_context(self, store):
-        store.add("memory", "x" * 490)
-        result = store.add("memory", "this will exceed the limit")
+        # Capacity-aware spill (2026-11-20) resolves the spillable case by moving a long entry to
+        # a reference. This test covers the case it cannot resolve: nothing eligible to move, so
+        # the refusal still hands the model the inventory it needs to consolidate.
+        store.add("memory", "x" * 250)
+        result = store.add("memory", "y" * 280)
         assert result["success"] is False
         assert "exceed" in result["error"].lower()
         # Overflow response gives the model what it needs to consolidate in-turn
@@ -173,7 +176,7 @@ class TestMemoryStoreAdd:
         assert "retry" in result["error"].lower()
 
         # A replace that blows the budget mirrors the add-overflow shape.
-        result = store.replace("memory", "x" * 490, "y" * 600)
+        result = store.replace("memory", "x" * 250, "z" * 520)
         assert result["success"] is False
         assert "current_entries" in result
         assert "usage" in result
@@ -273,9 +276,9 @@ class TestMemoryStoreReplace:
         """A refused write names the fix: the chars to free, and for an old_text that matches
         nothing, the entries it most resembles. Empty content falls back to new_text (#90468)."""
         store.add("memory", "Deploys go through GitHub Actions to Fly.io with manual approval.")
-        store.add("memory", "x" * 380)  # 65 + 3 + 380 = 448 of 500
-        full = store.add("memory", "y" * 54)  # 448 + 3 + 54 = 505
-        assert "by 5 chars" in full["error"] and "free at least 5 chars" in full["error"]
+        store.add("memory", "x" * 280)  # 65 + 3 + 280 = 348 of 500
+        full = store.add("memory", "y" * 160)  # 348 + 3 + 160 = 511
+        assert "by 11 chars" in full["error"] and "free at least 11 chars" in full["error"]
         miss = store.apply_batch("memory", [{"action": "patch", "old_text": "Deploys via GitHub Actions to Fly",
                                              "content": "Deploys: Fly.io + canary."}])
         assert miss["closest_entries"] == ["Deploys go through GitHub Actions to Fly.io with manual approval."]
