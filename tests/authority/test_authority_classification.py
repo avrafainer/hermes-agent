@@ -173,6 +173,28 @@ def test_shape2_leading_no_that_corrects_the_past_authorises(home, auth):
     assert "negation" in str(refused.value)
 
 
+@pytest.mark.parametrize(
+    ("sentence", "scope"),
+    [
+        ("No, we should not do that - pr03", "do that - pr03"),
+        ("No it doesn't need to be done", "need to be done"),
+        ("No, this must not ship", "must not ship"),
+    ],
+)
+def test_shape2_negated_correction_still_refuses(home, auth, sentence, scope):
+    """A leading "No" whose remainder is itself negated is a refusal, not a correction.
+
+    Reading only the modal verb ("should", "must", "needs to") turned every leading "No"
+    into authorisation. The remainder has to be checked for negation before the sentence
+    can be called a correction, or the fix for shape 2 becomes a way to mint grants out
+    of sentences that refuse the work.
+    """
+    refusal = _turn(home, "user", sentence)
+    with pytest.raises(auth.MintRefused) as refused:
+        _grant(auth, home, refusal, scope)
+    assert "negation" in str(refused.value)
+
+
 # -------------------------------------------------------------------------- shape 3
 
 def test_shape3_bare_imperative_binds_to_the_message_it_answers(home, auth):

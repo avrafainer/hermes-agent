@@ -295,6 +295,12 @@ def _classify_sentence(sent: str, scope_low: str) -> str:
         return "hypothetical"
     corrective = re.match(_CORRECTIVE, low)
     if corrective and re.search(_CORRECTIVE_AS_DIRECTIVE, corrective.group(1)):
+        # The remainder decides, and it can still negate the very thing it names: "No
+        # they SHOULD be done" corrects the past and authorises, while "No, we should
+        # not do that" refuses. Reading only the modal verb made every leading "No" a
+        # licence, which is how the gate starts inventing approval.
+        if re.search(_NEGATION, corrective.group(1)):
+            return "negation"
         return "directive"
     idx = low.find(scope_low)
     # Only the clause that runs into the scope can negate it. A long preamble — a routing
