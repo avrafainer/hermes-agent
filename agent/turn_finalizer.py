@@ -766,6 +766,16 @@ def finalize_turn(
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
 
+    # Post-turn compaction: the reply is persisted, so a high-context compaction now runs off
+    # the user's path. The next turn joins it (turn_context_compaction) before compacting.
+    if not interrupted and not failed and not vetoed and not getattr(agent, "_persist_disabled", False):
+        from agent.post_turn_compaction import schedule_post_turn_compaction
+        _guarded_cleanup(
+            "post_turn_compaction",
+            lambda: schedule_post_turn_compaction(agent, messages, task_id=effective_task_id),
+            _cleanup_errors, logger,
+        )
+
     # Keep the gateway's separate in-memory history snapshot current even on
     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
     with suppress(Exception):
