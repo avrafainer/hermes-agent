@@ -230,7 +230,15 @@ def _verify_message(message_id: str, session_id: str,
 # decides. The classes below are linguistic forms, not task words.
 
 _APPROVAL = r"^\W*(yes|yeah|yep|ok|okay|go ahead|do it|approved|approve|authori[sz]e|please|proceed)\b"
-_PERFORMATIVE = r"\b(i (authori[sz]e|approve|want|need)|i'?d like)\b"
+# "I AUTHORIZED IT ALL" was classified as narration, because "i authori[sz]e" requires the
+# bare infinitive and the word boundary after it fails on "authorized". First-person
+# approval in the past tense is still approval.
+_PERFORMATIVE = r"\b(i (authori[sz]e[ds]?|approve[ds]?|confirm(ed)?|want|need)|i'?d like)\b"
+# A leading "No" is a correction of what was just done, not a prohibition of what was
+# asked: "No they SHOULD be done" authorises exactly the thing it sounds like it refuses.
+# Only the remainder decides — "No, don't do that" keeps its negation.
+_CORRECTIVE = r"^\W*no\b[\s,:;-]+(.+)$"
+_CORRECTIVE_AS_DIRECTIVE = r"\b(should|must|needs? to|has to|have to|expect|meant|supposed)\b"
 _HYPOTHETICAL = r"\b(what if|if we|would|could|might|suppose|imagine|maybe|perhaps|whether|consider)\b"
 GRANT_ID_RE = re.compile(r"^g_[0-9a-f]{16}$")
 _NEGATION = r"(\bnot\b|n't\b|\bnever\b|\bno\b|\bstop\b|\bhold off\b|\bcancel\b)"
@@ -257,8 +265,15 @@ def _classify_sentence(sent: str, scope_low: str) -> str:
         return "question"
     if re.search(_HYPOTHETICAL, low):
         return "hypothetical"
+    corrective = re.match(_CORRECTIVE, low)
+    if corrective and re.search(_CORRECTIVE_AS_DIRECTIVE, corrective.group(1)):
+        return "directive"
     idx = low.find(scope_low)
-    if idx > 0 and re.search(_NEGATION, low[:idx]):
+    # Only the clause that runs into the scope can negate it. A long preamble — a routing
+    # note, a pasted report — routinely contains "not" several sentences earlier, and
+    # reading that as a negation refused a message whose last line authorised the work.
+    head_clause = re.split(r"[.!?;]\s+", low[:idx])[-1] if idx > 0 else ""
+    if idx > 0 and re.search(_NEGATION, head_clause):
         return "negation"
     if re.match(r"^\W*(don'?t|do not|never|no)\b", low):
         return "negation"
