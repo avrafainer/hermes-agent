@@ -38,7 +38,13 @@ export function terminalCompletionState(
   state: ClientSessionState,
   { text, occurredAt, persistedTurn, failure, status, failureReason }: TerminalCompletionArgs
 ): ClientSessionState | null {
-  if (state.interrupted) {
+  // A turn the backend completed AND persisted is the reply of record, even if
+  // a Stop latch from an earlier execution is still set on this window. Only a
+  // cancelled turn (status !== 'complete') may collapse here; otherwise the
+  // latch silently drops the persisted reply and nothing reconciles it.
+  const completedAndPersisted = status === 'complete' && persistedTurn?.complete === true
+
+  if (state.interrupted && !completedAndPersisted) {
     return {
       ...state,
       messages: bindStoppedTurnReceipt(
