@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -181,7 +182,19 @@ def _finalize_turn(agent, *, interrupted=False, failed=False, exit_reason="compl
 
 
 @pytest.fixture
-def scheduled(monkeypatch):
+def _hermetic_conversation_loop(monkeypatch):
+    # finalize_turn only takes `logger` from agent.conversation_loop, but importing that module runs
+    # hermes_bootstrap's import-time side effects (update settle, payload manifest reads) against the
+    # real checkout and home, which the home_io_guard refuses. Stand in a module with just the logger.
+    import logging
+    import types
+
+    stub = types.SimpleNamespace(logger=logging.getLogger("agent.conversation_loop"))
+    monkeypatch.setitem(sys.modules, "agent.conversation_loop", stub)
+
+
+@pytest.fixture
+def scheduled(monkeypatch, _hermetic_conversation_loop):
     calls = []
 
     def _record(agent, messages, *, task_id):
