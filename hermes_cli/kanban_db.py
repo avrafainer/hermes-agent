@@ -1398,7 +1398,20 @@ def create_task(
                 try:
                     from hermes_cli import authority as _authority
                     _parent = creator_task_id or (next(iter(parents)) if parents else None)
-                    _authority.bind_child(conn, task_id, _parent)
+                    _parent_grant = _authority.resolve(_parent)[0] if _parent else None
+                    if _parent_grant is not None:
+                        _authority.bind_child(conn, task_id, _parent)
+                    else:
+                        # Ungranted creator: the only authority a card can take is the
+                        # live dispatch grant minted in its own origin session (a real,
+                        # interactive session). Otherwise it stays unbound and refused.
+                        _derived = _authority.derive_origin_grant(task_id, session_id)
+                        if _derived:
+                            _append_event(conn, task_id, "grant_derived_binding", {
+                                "card": task_id, "session": _derived["session_id"],
+                                "grant": _derived["grant_id"],
+                                "issuing_message": _derived["message_id"],
+                            }, run_id=None)
                 except Exception:
                     pass
             return task_id

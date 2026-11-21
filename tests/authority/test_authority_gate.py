@@ -552,3 +552,97 @@ def test_a_profile_running_a_proxy_script_sees_the_same_grants(tmp_path, monkeyp
     monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "pm"))
     g, why = auth.resolve("t_p")
     assert g and g["grant_id"] == gid, why
+
+
+# ---------------------------------------------------------------- origin derivation
+# A card created outside her interactive turn carries no grant from its creator. The only
+# authority it can take is the live dispatch grant minted in the session the card was
+# created in, and only when that session is a real interactive one. Derivation happens at
+# creation and again at check time, so cards made before the rule existed are not frozen.
+
+def _board(home, rows):
+    """A minimal board beside the state db: tasks(id, session_id) is all derivation reads."""
+    con = sqlite3.connect(home / "kanban.db")
+    try:
+        con.execute("create table tasks (id text primary key, session_id text)")
+        con.executemany("insert into tasks values (?,?)", rows)
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_derivation_binds_the_origin_sessions_dispatch_grant(home, auth):
+    gid = _grant(auth, home)
+    _board(home, [("t_derived", "s1")])
+    derived = auth.derive_origin_grant("t_derived", "s1")
+    assert derived and derived["grant_id"] == gid
+    assert auth.check("t_derived", "dispatch")[0] == "allow"
+
+
+def test_check_time_derivation_heals_a_card_created_before_the_rule(home, auth):
+    _grant(auth, home)
+    _board(home, [("t_old", "s1")])
+    assert auth.resolve("t_old")[0] is None, "precondition: the card starts unbound"
+    verdict, reason = auth.check("t_old", "dispatch")
+    assert verdict == "allow", reason
+    assert auth.resolve("t_old")[0] is not None, "the healing binding is durable, not per-call"
+
+
+def test_derivation_refuses_a_card_whose_origin_session_is_a_worker(home, auth):
+    _grant(auth, home)
+    _board(home, [("t_worker", "s2")])          # s2 has source 'kanban'
+    assert auth.derive_origin_grant("t_worker", "s2") is None
+    assert auth.check("t_worker", "dispatch")[0] == "needs_approval"
+
+
+def test_derivation_refuses_a_grant_issued_before_the_session_started(home, auth):
+    _grant(auth, home)
+    con = sqlite3.connect(home / "state.db")
+    try:
+        con.execute("update sessions set started_at = ? where id = 's1'",
+                    (int(time.time()) + 3600,))
+        con.commit()
+    finally:
+        con.close()
+    _board(home, [("t_late", "s1")])
+    assert auth.derive_origin_grant("t_late", "s1") is None
+    assert auth.check("t_late", "dispatch")[0] == "needs_approval"
+
+
+def test_derivation_refuses_a_card_with_no_origin_session(home, auth):
+    _grant(auth, home)
+    _board(home, [("t_anon", None)])
+    assert auth._task_origin_session("t_anon") is None
+    assert auth.check("t_anon", "dispatch")[0] == "needs_approval"
+
+
+def test_derivation_refuses_when_the_board_is_unreadable(home, auth):
+    _grant(auth, home)
+    assert auth._task_origin_session("t_nowhere") is None
+    assert auth.check("t_nowhere", "dispatch")[0] == "needs_approval"
+
+
+def test_derivation_uses_only_the_cards_own_origin_session(home, auth):
+    """A live grant in some other session is not authority for this card."""
+    _grant(auth, home)                                     # her grant, in s1
+    con = sqlite3.connect(home / "state.db")
+    try:
+        con.execute("insert into sessions values ('s_other','other chat',?, 'desktop',0,0)",
+                    (int(time.time()),))
+        con.commit()
+    finally:
+        con.close()
+    _board(home, [("t_elsewhere", "s_other")])              # interactive, but no grant of its own
+    assert auth.derive_origin_grant("t_elsewhere", "s_other") is None
+    assert auth.check("t_elsewhere", "dispatch")[0] == "needs_approval"
+
+
+def test_a_derived_binding_is_audited(home, auth):
+    gid = _grant(auth, home)
+    _board(home, [("t_audit", "s1")])
+    auth.derive_origin_grant("t_audit", "s1")
+    log = (home / "state" / "authority-log.jsonl").read_text().splitlines()
+    entries = [json.loads(line) for line in log]
+    hit = [e for e in entries if e["task"] == "t_audit" and e["action"] == "derive_origin"]
+    assert hit and hit[-1]["grant"] == gid
+    assert "origin session s1" in hit[-1]["reason"]

@@ -512,6 +512,15 @@ def check(task_id: str, action: str, *, profile: Optional[str] = None) -> tuple[
         _log(task_id, action, "deny", f"resolver failed: {exc}", m)
         return ("allow", "resolver failed; mode is not enforce") if m == "shadow" else ("deny", f"resolver failed: {exc}")
     if g is None:
+        # Check-time derivation. A card created before the origin rule existed carries
+        # no binding and would otherwise stay frozen forever, which is the freeze this
+        # rule was written for. The conditions are identical to creation time: a real
+        # interactive origin session, and a live dispatch grant issued after it began.
+        # Ambiguity still resolves to unbound, never to allow.
+        origin = _task_origin_session(task_id)
+        if origin and derive_origin_grant(task_id, origin):
+            g, why = resolve(task_id)
+    if g is None:
         verdict, reason = "needs_approval", why
     elif action not in g["actions"]:
         verdict, reason = "needs_approval", f"grant {g['grant_id']} does not include {action}"
@@ -712,6 +721,100 @@ def bind_child(con: sqlite3.Connection, child_task: str,
     _log(child_task, "create_child", "allow", f"inherited {g['grant_id']}", mode(),
          grant=g["grant_id"])
     return g["grant_id"]
+
+
+# ---------------------------------------------------------------- origin derivation
+
+_NON_INTERACTIVE_SOURCES = {"worker", "kanban", "cron", "scheduler"}
+
+
+def derive_origin_grant(task_id: str, session_id: Optional[str]) -> Optional[dict]:
+    """Bind a card to the live dispatch grant minted in its origin session, if one exists.
+
+    Used only when the card has no grant through its creator. The origin session is the
+    session_id stamped on the task row at creation. Every refusal returns None, so an
+    ambiguous or unreadable origin leaves the card unbound. Never returns an allowance
+    the creating worker holds on its own account.
+    """
+    if not session_id or not isinstance(session_id, str):
+        return None
+    state = pathlib.Path(os.environ.get("HERMES_STATE_DB") or _home() / "state.db")
+    try:
+        sc = sqlite3.connect(f"file:{state}?mode=ro", uri=True)
+        sc.row_factory = sqlite3.Row
+        try:
+            srow = sc.execute("select source, started_at from sessions where id=?",
+                              (session_id,)).fetchone()
+        finally:
+            sc.close()
+    except sqlite3.Error:
+        return None
+    if srow is None:
+        return None
+    src = str(srow["source"] or "").strip().lower()
+    if not src or src in _NON_INTERACTIVE_SOURCES:
+        return None
+    try:
+        started = float(srow["started_at"])
+    except (TypeError, ValueError):
+        return None
+    db = connect()
+    try:
+        rows = db.execute(
+            "SELECT * FROM grants WHERE provenance_session = ? AND revoked_at IS NULL "
+            "ORDER BY issued_at DESC", (session_id,)).fetchall()
+        now = int(time.time())
+        for row in rows:
+            if int(row["issued_at"]) < started:
+                continue  # a grant from an earlier life of this session
+            if row["expires_at"] and int(row["expires_at"]) <= now:
+                continue
+            try:
+                acts = set(json.loads(row["actions"] or "[]"))
+            except (TypeError, ValueError):
+                continue
+            if "dispatch" not in acts:
+                continue
+            if not _row_ok(row):
+                return None  # tampered row: ambiguity resolves to unbound
+            try:
+                bind(task_id, row["grant_id"])
+            except BindRefused:
+                return None  # the row passed this check but bind refused it: stay unbound
+            _log(task_id, "derive_origin", "allow",
+                 f"derived from origin session {session_id}", mode(), grant=row["grant_id"])
+            return {"grant_id": row["grant_id"], "session_id": session_id,
+                    "message_id": row["provenance_message"], "source": src}
+    finally:
+        db.close()
+    return None
+
+
+def _task_origin_session(task_id: str) -> Optional[str]:
+    """The session a card was created in, read straight from the board.
+
+    The board is read as a file rather than imported: this module stays independent of
+    the kanban tool layer so the CLI, the dispatcher and the sandbox all reach the same
+    answer. Any failure returns None, which leaves the card unbound.
+    """
+    path = pathlib.Path(os.environ.get("HERMES_KANBAN_DB") or (_home() / "kanban.db"))
+    if not path.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        try:
+            con = sqlite3.connect(str(path))
+            con.execute("pragma query_only=1")
+        except sqlite3.Error:
+            return None
+    try:
+        row = con.execute("select session_id from tasks where id=?", (task_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    return row[0] if row and row[0] else None
 
 
 # ---------------------------------------------------------------- OS isolation

@@ -206,6 +206,19 @@ def _profile_author() -> str:
     return current_profile_name("user") or "user"
 
 
+def _ambient_session_id() -> Optional[str]:
+    """The session this CLI call was made from, when a gateway or desktop bound one.
+
+    Returns None in a bare terminal, which is honest: no session means no provenance, and
+    authority derivation will refuse the card rather than guess.
+    """
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env("HERMES_SESSION_KEY", "") or None
+    except Exception:
+        return None
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
@@ -398,6 +411,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
+            # The session this card was created in is the provenance authority derivation
+            # reads. Without it a card made from her own turn is indistinguishable from an
+            # anonymous one, which is how the 2026-11-21 freeze happened: cards made by a
+            # script during her session carried NULL and could never be bound.
+            session_id=_ambient_session_id(),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

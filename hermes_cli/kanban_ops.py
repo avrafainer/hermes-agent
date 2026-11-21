@@ -67,6 +67,10 @@ def dispatch_payload(res) -> dict:
             {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
         ],
         "skipped_unassigned": res.skipped_unassigned,
+        "skipped_unauthorized": [
+            {"task_id": tid, "reason": reason}
+            for (tid, reason) in res.skipped_unauthorized
+        ],
         "skipped_nonspawnable": res.skipped_nonspawnable,
         "skipped_per_profile_capped": [
             {"task_id": tid, "assignee": who, "current": current}
@@ -161,6 +165,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    for tid, reason in res.skipped_unauthorized:
+        print(f"Refused (no authority, {reason}): {tid}")
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
     if res.skipped_nonspawnable:
