@@ -3,13 +3,12 @@
 
     HERMES_HOME=~/.hermes python3 scripts/authority_origin_census.py [--json]
 
-Every live card lands in exactly one state:
+Every live card lands in exactly one of three states (brief section 4, no fourth state):
   derived    bound by origin derivation (an authority-log line 'derive_origin' names it)
   inherited  bound through an attributable parent (log line 'inherited ... from parent')
-  bound      bound, but by a path that did not log its binding (predates bind() logging)
-  unauthorised  unbound, and nothing attributable reaches it. New cards in this state are
-                refused at creation; existing cards are listed here, not refused retroactively.
-  unbound    unbound, but an attributable parent or origin exists (should not persist)
+  blocked    not derived and not inherited. The detail says why: 'unlogged-binding' (a grant
+             is bound, but no log line names the path, so attribution cannot be shown), or the
+             resolver's reason for an unbound card (no origin, no attributable parent).
 
 Writes nothing. It reads the board, the grant store and the authority log through the same
 authority module the dispatcher uses, so the answer is the dispatcher's answer.
@@ -67,15 +66,14 @@ def classify(home: pathlib.Path) -> list[dict]:
             continue
         grant, why = auth.resolve(task_id)
         reasons = logs.get(task_id, set())
-        if grant is None:
-            state = "unauthorised" if auth.attributable_grant(task_id) is None else "unbound"
-            detail = why
-        elif any(r.startswith("derive_origin:") for r in reasons):
+        if grant is not None and any(r.startswith("derive_origin:") for r in reasons):
             state, detail = "derived", grant["grant_id"]
-        elif any(r.startswith("dispatch:inherited ") for r in reasons):
+        elif grant is not None and any(r.startswith("dispatch:inherited ") for r in reasons):
             state, detail = "inherited", grant["grant_id"]
+        elif grant is not None:
+            state, detail = "blocked", f"unlogged-binding {grant['grant_id']}"
         else:
-            state, detail = "bound", grant["grant_id"]
+            state, detail = "blocked", why
         rows.append({"card": task_id, "status": status, "session_id": session_id,
                      "state": state, "detail": detail})
     return rows

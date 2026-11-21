@@ -10,7 +10,7 @@ import sqlite3
 
 import pytest
 
-from tests.authority.test_authority_gate import _board, _grant, _user_msg, auth, home  # noqa: F401
+from tests.authority.test_authority_gate import _board, _grant, _user_msg, auth, home
 
 
 def _log_lines(home):
@@ -105,7 +105,7 @@ def test_an_unrelated_card_cannot_borrow_another_cards_grant(home, auth):
 
 
 def test_a_grant_is_passed_on_only_along_the_cards_own_links(home, auth):
-    gid = _grant(auth, home)
+    _grant(auth, home)
     _board(home, [("t_owner", "s1"), ("t_sibling", None), ("t_other", None)])
     auth.derive_origin_grant("t_owner", "s1")
     _links(home, [("t_other", "t_sibling")])         # a link to a card that holds nothing
@@ -175,3 +175,14 @@ def test_only_enforce_mode_refuses_at_creation(home, auth, monkeypatch):
     monkeypatch.setenv("HERMES_AUTHORITY_MODE", "shadow")
     _grant(auth, home)
     assert _create(title="shadow card")              # refusal is an enforce-mode behaviour
+
+
+def test_refusal_names_the_real_cause_when_a_session_holds_no_grant(home, auth):
+    from hermes_cli.authority import OriginRefused
+    _grant(auth, home)
+    with pytest.raises(OriginRefused) as exc:
+        _create(title="unlicensed", session_id="s-without-grant")
+    msg = str(exc.value)
+    assert "origin session s-without-grant holds no live dispatch grant" in msg
+    assert "no origin session (session_id was not supplied)" not in msg
+    assert _task_count(home) == 0

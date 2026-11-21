@@ -1421,12 +1421,18 @@ def create_task(
                 from hermes_cli import authority as _authority
                 if (task_status != "triage" and _authority.mode() == "enforce"
                         and _authority.resolve(task_id)[0] is None):
+                    if session_id:
+                        cause = (f"origin session {session_id} holds no live dispatch grant, "
+                                 "and no attributable ancestor grant exists")
+                        fix = ("Create it from a session that holds a live dispatch grant, "
+                               "or as a child of a card whose grant was issued in its own origin session.")
+                    else:
+                        cause = "no origin session (session_id was not supplied) and no attributable ancestor grant"
+                        fix = ("Create it from an interactive session that holds a live dispatch grant "
+                               "(pass session_id), or as a child of a card whose grant was issued in its own origin session.")
                     raise _authority.OriginRefused(
-                        f"refused: card {task_id} ({title.strip()!r}) has no origin session "
-                        "and no attributable ancestor grant, so it could never dispatch. Create it "
-                        "from an interactive session that holds a live dispatch grant (pass "
-                        "session_id), or as a child of a card whose grant was issued in its own "
-                        "origin session.")
+                        f"refused: card {task_id} ({title.strip()!r}) has {cause}, so it could never "
+                        f"dispatch. {fix}")
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
