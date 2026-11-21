@@ -244,12 +244,34 @@ _CORRECTIVE_AS_DIRECTIVE = r"\b(should|must|needs? to|has to|have to|expect|mean
 # imperative, never to promote narration.
 _OFFER_TAIL = re.compile(
     r"(\?|\b(want me to|shall i|should i|would you like|do you want|i suggest|i recommend|"
-    r"the fix|the next fix|next step|options?:)\b)", re.I)
+    r"the fix|the next fix|next step|options?:)\b)", re.IGNORECASE)
 _HYPOTHETICAL = r"\b(what if|if we|would|could|might|suppose|imagine|maybe|perhaps|whether|consider)\b"
 GRANT_ID_RE = re.compile(r"^g_[0-9a-f]{16}$")
 _NEGATION = r"(\bnot\b|n't\b|\bnever\b|\bno\b|\bstop\b|\bhold off\b|\bcancel\b)"
 _SUBJECT_START = r"^(the|a|an|this|that|these|those|it|they|we|he|she|i|my|our|there|its|their)\b"
 _REPORT_LINE = r"^(\s*([-*|>#]|\d+[.)])|\s*)\s*(summary|source|kind|evidence|next step|size|status|findings?|proposals?|pm review|done|completed)\b"
+
+
+_OOB_OPEN = re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]", re.IGNORECASE)
+_OOB_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
+
+
+def _oob_body(text: str) -> str:
+    """The body of an out-of-band envelope, or the text unchanged.
+
+    The envelope is the delivery mechanism, not narration: her direct speech is what sits
+    between the markers. Classifying the envelope's own prose — "not tool output and not a
+    new delivery" — as part of her sentence read it as a negation. Only the body decides,
+    and the body still has to be a directive: an envelope carrying a routing note or a
+    pasted report classifies as narration and grants nothing.
+    """
+    opened = _OOB_OPEN.search(text or "")
+    if not opened:
+        return text
+    rest = text[opened.end():]
+    end = rest.find(_OOB_CLOSE)
+    body = rest[:end] if end >= 0 else rest
+    return body.strip() or text
 
 
 def _sentences(text: str) -> list[str]:
@@ -299,6 +321,9 @@ def assess(text: str, scope_cite: str) -> tuple[bool, str]:
     Only a sentence that contains the quoted scope can authorise it, so a scope named
     inside a pasted report, a quotation or a question never grants anything.
     """
+    # An OOB envelope is the delivery, not the message: decide on her body, so the
+    # envelope's own prose cannot negate or narrate the sentence she wrote.
+    text = _oob_body(text)
     body = " ".join((text or "").split())
     scope = (scope_cite or "").strip().lower()
     if not scope:
