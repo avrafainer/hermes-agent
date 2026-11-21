@@ -585,6 +585,9 @@ DEFAULT_CONFIG = {
         # (~3x fewer retained tokens; a few extra summarizer calls at the boundary). "legacy" =
         # 0.20×threshold verbatim tail (100-240K tokens on big windows).
         "tail_mode": "lean",
+        # summary_parallel_chunks: 1 = one summary call (as before). N>1 splits the pre-tail records into N
+        # contiguous parts summarised concurrently, joined in order (cut only before non-tool records).
+        "summary_parallel_chunks": 1,
         # protect_last_n: minimum recent messages kept uncompressed, honoured up to a small count
         # floor; the verbatim tail is otherwise token-bounded and never above 20% of the window.
         "protect_last_n": 20,

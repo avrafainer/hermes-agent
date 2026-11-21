@@ -114,6 +114,7 @@ class PreparedSummary(_Window):
     call_state: dict[str, Any] = field(default_factory=dict, compare=False)  # _SUMMARY_CALL_STATE after the pass
     telemetry: dict[str, Any] = field(default_factory=dict, compare=False)  # _SUMMARY_CALL_TELEMETRY of the pass
     waited: Optional[float] = field(default=None, compare=False)  # seconds the taking compaction waited on the pass
+    chunk_count: int = field(default=1, compare=False)  # summary requests the pass made (>1 when the window was split)
 
 
 class _PendingPass:
@@ -484,6 +485,7 @@ class PreparedCompaction:
                     summary, worker._previous_summary,
                     call_state={name: getattr(worker, name, None) for name in _SUMMARY_CALL_STATE},
                     telemetry={key: telemetry.get(key) for key in _SUMMARY_CALL_TELEMETRY},
+                    chunk_count=getattr(worker, "_last_summary_chunk_count", 1),
                 )
                 logger.info("prepared compaction: pass completed session=%s window=%d-%d in %.1fs",
                             window.session_id, window.compress_start, window.compress_end, time.monotonic() - started)
@@ -548,6 +550,7 @@ def adopt(compressor: Any, prepared: PreparedSummary) -> None:
     compressor._record_summary_success(prepared.body)
     for name, value in prepared.call_state.items():
         setattr(compressor, name, value)
+    compressor._last_summary_chunk_count = prepared.chunk_count  # the caller reads it into telemetry after adopt
     if isinstance(telemetry, dict):
         telemetry.update({key: value for key, value in prepared.telemetry.items() if value is not None})
         telemetry["prepared_summary"] = True

@@ -629,6 +629,37 @@ def test_splice_carries_the_passs_main_model_fallback_and_call_telemetry(monkeyp
     assert telemetry["method"] == "aux_fallback_main"
 
 
+def test_split_pass_splice_reports_its_real_chunk_count(monkeypatch):
+    """A window split into parts on the background pass must report that count after the splice,
+    not the inline default of 1: telemetry chunk_count is the number of summary requests behind it."""
+    import agent.context_compressor as module
+
+    cc = _compressor()
+    cc.tail_mode = "lean"
+    cc._summary_parallel_chunks = 3
+    msgs = _messages(200, size=300)
+    monkeypatch.setattr(_StubCompressor, "_generate_summary", module.ContextCompressor._generate_summary)
+    # The user-turn probe imports the conversation loop, whose import-time update settle touches the real install.
+    monkeypatch.setattr(cc, "_ground_historical_task_snapshot", lambda summary, turns: summary, raising=False)
+
+    requests = []
+
+    def call_llm(**kwargs):
+        requests.append(threading.current_thread().name)
+        message = SimpleNamespace(content="## Summary\n- part body", reasoning_content=None, reasoning=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
+
+    monkeypatch.setattr(module, "call_llm", call_llm)
+    entry = _prepare(cc, msgs)
+    assert entry.chunk_count == 3, "the pass itself made three requests"
+    cc.compress(msgs, current_tokens=cc.threshold_tokens + 1)
+
+    assert len(requests) == 3, "the pass made three requests and the splice made none inline"
+    telemetry = cc._last_compression_telemetry
+    assert telemetry is not None and telemetry["prepared_summary"] is True
+    assert telemetry["chunk_count"] == 3
+
+
 # --------------------------------------------------------------------------- the real turn loop
 
 

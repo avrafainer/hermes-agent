@@ -755,6 +755,14 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 # Prompt-side char cap on the serialized turn block (~40K tokens; head+tail kept,
 # see _bound_summary_input). NEVER add a max_tokens wire cap on the summary call.
 _SUMMARY_INPUT_MAX_CHARS = 160_000
+# Fewer records than this per part and the split costs more than it saves: each part gets less
+# context and the summary loses cross-part continuity for no wall-clock gain.
+_MIN_RECORDS_PER_CHUNK = 25
+
+
+def _sum_coverages(parts: list[dict[str, int]]) -> dict[str, int]:
+    """Add per-part sampling coverage so chunked telemetry reads as one window."""
+    return {key: sum(part[key] for part in parts) for key in parts[0]}
 
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
@@ -2672,12 +2680,15 @@ class ContextCompressor(
         api_mode: str = "", abort_on_summary_failure: bool = False, max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
-        proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
+        proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1,
+        tail_mode: str = "lean", summary_parallel_chunks: int = 1,
         custom_providers: list | None = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
+        # Concurrent summary parts (1 = one summary call). Set from compression.summary_parallel_chunks.
+        self._summary_parallel_chunks = summary_parallel_chunks
         # Per-model context_length overrides live in custom_providers; without them deferred
         # resolution falls back to the hardcoded family catalog (#83324).
         self.custom_providers = custom_providers or None
@@ -3587,6 +3598,95 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             )
         return content
 
+    def _split_turns_for_summary(
+        self, turns: list[dict[str, Any]], records: list[str],
+    ) -> Optional[list[tuple[int, int]]]:
+        """Contiguous ``(start, end)`` ranges over ``turns`` for concurrent summary parts, or None.
+
+        Opt-in via ``compression.summary_parallel_chunks`` (default 1). ``records`` is 1:1 with ``turns``.
+        A cut is only made before a message whose role is not ``tool``, so every tool result travels in
+        the same part as the assistant tool call it answers. Below ``_MIN_RECORDS_PER_CHUNK`` per part
+        the split is a no-op: three tiny calls cost more, and carry less context each, than one.
+        """
+        count = getattr(self, "_summary_parallel_chunks", 1)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 2:
+            return None
+        if len(records) != len(turns) or len(turns) < count * _MIN_RECORDS_PER_CHUNK:
+            return None
+        target = max(1, sum(len(r) for r in records) // count)
+        ranges: list[tuple[int, int]] = []
+        start, size = 0, 0
+        for index, (msg, record) in enumerate(zip(turns, records)):
+            if (
+                index > start
+                and msg.get("role") != "tool"
+                and size >= target
+                and len(ranges) < count - 1
+                and index - start >= _MIN_RECORDS_PER_CHUNK
+            ):
+                ranges.append((start, index))
+                start, size = index, 0
+            size += len(record)
+        ranges.append((start, len(turns)))
+        if len(ranges) < 2 or any(end - begin < _MIN_RECORDS_PER_CHUNK for begin, end in ranges[:-1]):
+            return None
+        return ranges
+
+    @staticmethod
+    def _summary_part_banner(index: int, count: int) -> str:
+        return (
+            f"This is part {index + 1} of {count} of ONE conversation, split for length. "
+            "Summarise only what this part contains, in the usual structure. Do not mention "
+            "the split, do not summarise the other parts, and leave no trailing 'to be continued'.\n\n"
+        )
+
+    def _lean_summary_messages(
+        self, turns: list[dict[str, Any]], records: list[str], summary_budget: int,
+        focus_topic: Optional[str], memory_context: str, has_user_turn: bool, banner: str = "",
+    ) -> tuple[list[dict[str, str]], dict[str, int]]:
+        """Lean-mode ``[system, user, typed...]`` request for one window of turns, plus sampling coverage."""
+        slices: list = []
+        _, coverage = self._sample_summary_records(records, slices)
+        # Typed turns (#146750): user, assistant tool_calls and tool output each keep their real role.
+        # Typed rows (async-delegation results, notices; not /steer) and flagged nudges are not user input.
+        typed_turns = typed_summary_messages(
+            turns, records, slices,
+            lambda m: self._is_real_user_turn(m) and not is_user_role_scaffolding(m),
+            self._render_tool_args_for_summary,
+        )
+        messages = self._build_summary_prompt(TYPED_TURNS_POINTER, summary_budget, focus_topic, memory_context, has_user_turn)
+        if banner:
+            messages[0] = {**messages[0], "content": banner + messages[0]["content"]}
+        messages[1:1] = typed_turns
+        return messages, coverage
+
+    def _call_summary_llm_parallel(
+        self, part_messages: list[list[dict[str, str]]], prompt_started_at: float,
+    ) -> str:
+        """Summarise the parts concurrently and join them in order.
+
+        Each part goes through ``_call_summary_llm``, so routing, validation, truncation detection,
+        interrupt shielding and the cooldown/failure machinery match the single-call path. A truncated
+        or empty part raises, which sends the whole summary through the existing fallback chain rather
+        than committing a half-summary. ``_last_aux_resolved_model`` is written per call and the last
+        writer wins; every part resolves the same route, so that is acceptable.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        count = len(part_messages)
+        results: list[Optional[str]] = [None] * count
+
+        def _summarise(index: int) -> None:
+            results[index] = self._call_summary_llm(part_messages[index], prompt_started_at)
+
+        with ThreadPoolExecutor(max_workers=count, thread_name_prefix="sumsummary") as pool:
+            futures = [pool.submit(_summarise, i) for i in range(count)]
+            for future in futures:
+                future.result()
+        if any(not r for r in results):
+            raise RuntimeError("Parallel summary produced an empty part; refusing a partial summary")
+        return "\n\n".join(f"### Part {i + 1} of {count}\n{results[i]}" for i in range(count))
+
     def _generate_summary(
         self, turns_to_summarize: list[dict[str, Any]], focus_topic: Optional[str] = None,
         memory_context: str = "", bypass_cooldown: bool = False,
@@ -3614,30 +3714,44 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         _pruned_skill_names = list(dict.fromkeys(
             _collect_ghosted_skill_names(turns_to_summarize) + _extract_pruned_skill_names(self._previous_summary or "")
         ))[:_MAX_PRUNED_SKILL_MARKERS]
-        # Lean mode even-samples oversized input (one bounded request, never a second).
-        if getattr(self, "tail_mode", "lean") == "lean":
-            records = self._serialize_records_for_summary(turns_to_summarize)
-            slices: list = []
-            content_to_summarize, coverage = self._sample_summary_records(records, slices)
-            self._record_summary_input_coverage(coverage)
-            # Typed turns (#146750): user, assistant tool_calls and tool output each keep their real role.
-            # Typed rows (async-delegation results, notices; not /steer) and flagged nudges are not user input.
-            typed_turns = typed_summary_messages(
-                turns_to_summarize, records, slices,
-                lambda m: self._is_real_user_turn(m) and not is_user_role_scaffolding(m),
-                self._render_tool_args_for_summary,
-            )
-            content_to_summarize = TYPED_TURNS_POINTER
-        else:
-            typed_turns = []
-            content_to_summarize = self._bound_summary_input(self._serialize_for_summary(turns_to_summarize))
         has_user_turn = getattr(self, "_summary_has_user_turn", None)
         if has_user_turn is None:
             has_user_turn = self._transcript_has_real_user_turn(turns_to_summarize)
-        messages = self._build_summary_prompt(content_to_summarize, summary_budget, focus_topic, memory_context, has_user_turn)
-        messages[1:1] = typed_turns
+        # Lean mode even-samples oversized input per request. Chunked (opt-in) splits the window into
+        # N requests first, so each part is sampled within its own bound and no record is dropped.
+        chunk_ranges = None
+        messages: list[dict[str, str]] = []
+        part_messages: list[list[dict[str, str]]] = []
+        if getattr(self, "tail_mode", "lean") == "lean":
+            records = self._serialize_records_for_summary(turns_to_summarize)
+            chunk_ranges = self._split_turns_for_summary(turns_to_summarize, records)
+            self._last_summary_chunk_count = len(chunk_ranges) if chunk_ranges else 1
+            if chunk_ranges:
+                count = len(chunk_ranges)
+                per_part_budget = max(800, summary_budget // count)
+                coverages: list[dict[str, int]] = []
+                for index, (start, end) in enumerate(chunk_ranges):
+                    part, coverage = self._lean_summary_messages(
+                        turns_to_summarize[start:end], records[start:end], per_part_budget,
+                        focus_topic, memory_context, has_user_turn, self._summary_part_banner(index, count),
+                    )
+                    part_messages.append(part)
+                    coverages.append(coverage)
+                self._record_summary_input_coverage(_sum_coverages(coverages))
+            else:
+                messages, coverage = self._lean_summary_messages(
+                    turns_to_summarize, records, summary_budget, focus_topic, memory_context, has_user_turn,
+                )
+                self._record_summary_input_coverage(coverage)
+        else:
+            self._last_summary_chunk_count = 1
+            content_to_summarize = self._bound_summary_input(self._serialize_for_summary(turns_to_summarize))
+            messages = self._build_summary_prompt(content_to_summarize, summary_budget, focus_topic, memory_context, has_user_turn)
         try:
-            content = self._call_summary_llm(messages, prompt_started_at)
+            if chunk_ranges:
+                content = self._call_summary_llm_parallel(part_messages, prompt_started_at)
+            else:
+                content = self._call_summary_llm(messages, prompt_started_at)
             # Strip <think> blocks: they would be stored, injected, and compounded on every iterative update.
             from agent.agent_runtime_helpers import strip_think_blocks
             content = strip_think_blocks(None, content).strip() or content
@@ -5119,6 +5233,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             or self._feasibility_skip(telemetry, turns_to_summarize, compress_start, compress_end)
         )
         summary = None  # pre-LLM summary skip (feasibility or benched model): no LLM call; Phase 4 inserts the deterministic fallback
+        self._last_summary_chunk_count = 1
         if prepared:
             # The pass ran this window through _generate_summary; adopt its result as an inline call would.
             summary = self._adopt_prepared_summary(prepared)
@@ -5130,6 +5245,8 @@ Write only the summary body. Do not include any preamble or prefix."""
                 telemetry, compress_end - compress_start, scan.previous_summary_before,
             ):
                 return canonical_messages
+        # Real count of summary requests behind this summary (1 unless the window was split into parts).
+        telemetry["chunk_count"] = self._last_summary_chunk_count if turns_to_summarize else 0
         if not summary:
             summary = self._fallback_summary_for_window(
                 telemetry, turns_to_summarize, compress_end - compress_start, feasibility_skip,
