@@ -681,6 +681,21 @@ DEFAULT_CONFIG = {
         "idle_compact_after_seconds": 0,
         # Opt-in: write the next summary in the background near the trigger; compaction uses (or waits for) it if it still covers the same messages.
         "prepare_ahead": False,
+        # post_turn_compact: opt-in. Run the full summary pass AFTER the reply has been delivered,
+        # once context passes post_turn_compact_ratio of the threshold, instead of in front of the
+        # next request. Same compressor path, same lock, same transcript rule; only the moment moves.
+        # The measured cost is the summary call alone (12.6s on a fast summariser, 67s when the
+        # primary rate-limits and the chain takes over), so this is the only lever that removes the
+        # wait rather than shortening it.
+        "post_turn_compact": False,
+        # Fraction of threshold_tokens that arms it (0.1-0.99; 0.75 = 225K on a 300K threshold).
+        "post_turn_compact_ratio": 0.75,
+        # summary_parallel_chunks: 1 = one summary call, as before. N>1 splits the pre-tail records
+        # into N contiguous parts and summarises them concurrently, joined in order. Measured
+        # 2026-11-05 on a 388,738-char window: 12.6s as one call, 5.6s as three. Nothing is dropped;
+        # parts never split a record, and a part that fails fails the whole summary rather than
+        # committing a half one.
+        "summary_parallel_chunks": 1,
     },
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "auto" (default) | "5m" | "1h"
     # (auto = 1h for human-paced sessions — cli/tui/desktop/messaging — and 5m for subagent, cron,

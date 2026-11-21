@@ -1379,6 +1379,16 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     # Opt-in idle compaction: compact up front when a session resumes after this many
     # seconds idle (0 = disabled). Consumed by build_turn_context().
     idle_compact_after_seconds = max(0, int(cfg.get("idle_compact_after_seconds", 0)))
+    # Post-turn compaction (opt-in): compact after the reply has been delivered, once context passes
+    # this fraction of the threshold. Same compressor path as the mid-turn trigger, so the transcript
+    # rule is unchanged; only the moment moves, out of the user's wait.
+    post_turn_compact = _cfg_flag(cfg, "post_turn_compact", False)
+    try:
+        post_turn_compact_ratio = float(cfg.get("post_turn_compact_ratio", 0.75))
+    except (TypeError, ValueError):
+        post_turn_compact_ratio = 0.75
+    if not (0.1 <= post_turn_compact_ratio <= 0.99):
+        post_turn_compact_ratio = 0.75
     return CompressionSettings(
         threshold=threshold,
         autoraise_notice_enabled=autoraise_notice_enabled,
@@ -1427,6 +1437,9 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         codex_responses_compact_threshold=compact_threshold,
         idle_compact_after_seconds=idle_compact_after_seconds,
         prepare_ahead=is_truthy_value(cfg.get("prepare_ahead"), default=False),
+        post_turn_compact=post_turn_compact,
+        post_turn_compact_ratio=post_turn_compact_ratio,
+        summary_parallel_chunks=max(1, min(6, _parse_config_int(cfg.get("summary_parallel_chunks", 1), 1))),
     )
 
 
@@ -1867,6 +1880,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         ("_micro_compact_enabled", cs.micro_compact),
         ("_micro_compact_every_n_turns", cs.micro_compact_every_n_turns),
         ("_micro_compact_defrag_threshold_tokens", cs.micro_compact_defrag_tokens),
+        ("_summary_parallel_chunks", cs.summary_parallel_chunks),
     ):
         if hasattr(_cc, _attr):
             setattr(_cc, _attr, _value)
@@ -1886,6 +1900,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     )
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
+    agent.compression_post_turn_compact = cs.post_turn_compact
+    agent.compression_post_turn_compact_ratio = cs.post_turn_compact_ratio
 
 
 def _enforce_minimum_context(agent):

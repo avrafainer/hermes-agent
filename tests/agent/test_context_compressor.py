@@ -136,7 +136,11 @@ class TestLegacyClarifyResults:
         c.compress(messages, force=True)
         assert requests, "exercise the public compression path, not a no-op window"
         dispatched = json.dumps(requests[0])
-        assert json.dumps(expected_summary)[1:-1] in dispatched
+        # Pruned or whole, the clarify result must reach the summariser. With the summary-input
+        # budget in play a window that already fits is not stubbed at all, so the same contract
+        # holds in either form.
+        assert (json.dumps(expected_summary)[1:-1] in dispatched
+                or json.dumps(content)[1:-1] in dispatched)
         if expected is None or expected != answer:
             assert "using your own judgment" not in dispatched
             assert "reasonable assumption" not in dispatched
@@ -514,6 +518,70 @@ class TestSummarizeToolResultRefusals:
         assert count == 1 and "BLOCKED, not run" in summary and "did NOT consent" in summary
         pruned_again, _ = compressor._prune_old_tool_results(pruned, protect_tail_count=2)
         assert pruned_again[1]["content"] == summary
+
+
+class TestSummaryBudgetDecidesPruning:
+    """Pass 2 demotes old tool results to fit what the summariser reads, not to fit the tail.
+    With `_SUMMARY_INPUT_MAX_CHARS` at 600K a 300K-token middle window (about 245K chars of
+    JSON-heavy results) fits whole, so demoting it would hand the summariser stubs for output it
+    had room to read. The budget is where that decision belongs."""
+
+    def _messages(self, body_chars: int = 4000, rounds: int = 3) -> list:
+        # Bodies differ per round: identical ones would be collapsed by the dedupe pass, which is
+        # a different (and correct) reason to replace a result.
+        def body(i: int) -> str:
+            return f"round-{i} " + "z" * (body_chars - len(f"round-{i} "))
+        messages: list[dict] = [{"role": "user", "content": "do the thing"}]
+        for i in range(rounds):
+            messages.append({"role": "assistant", "tool_calls": [{"id": f"t{i}", "type": "function",
+                             "function": {"name": "terminal", "arguments": json.dumps({"command": f"cmd {i}"})}}]})
+            messages.append({"role": "tool", "tool_call_id": f"t{i}", "content": body(i)})
+            messages.append({"role": "assistant", "content": f"step {i} done"})
+            messages.append({"role": "user", "content": f"next {i}"})
+        messages.append({"role": "assistant", "content": "ready"})
+        messages.append({"role": "user", "content": "latest ask"})
+        return messages
+
+    def test_a_middle_that_fits_is_left_whole(self, compressor):
+        messages = self._messages()
+        bodies = [m["content"] for m in messages if m.get("role") == "tool"]
+        pruned, count = compressor._prune_old_tool_results(
+            messages, protect_tail_count=2, summary_input_budget=600_000,
+        )
+        assert count == 0
+        assert [m["content"] for m in pruned if m.get("role") == "tool"] == bodies
+
+    def test_over_budget_demotes_the_oldest_only_until_it_fits(self, compressor):
+        messages = self._messages(body_chars=4000, rounds=5)  # 20,000 chars of tool output
+        pruned, count = compressor._prune_old_tool_results(
+            messages, protect_tail_count=2, summary_input_budget=15_000,
+        )
+        bodies = [m["content"] for m in pruned if m.get("role") == "tool"]
+        # The excess goes oldest-first; the newest results keep their detail.
+        assert count == 2, bodies
+        assert bodies[0].startswith("[terminal] ran") and bodies[1].startswith("[terminal] ran")
+        assert bodies[2].startswith("round-2 ") and bodies[4].startswith("round-4 ")
+
+    def test_no_budget_keeps_the_historical_demote_everything_rule(self, compressor):
+        messages = self._messages()
+        _pruned, count = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert count == 3
+
+    def test_clarify_is_demoted_even_when_the_window_fits(self, compressor):
+        payload = json.dumps({"question": "which?", "choices_offered": ["a", "b"],
+                              "user_response": "The user did not answer. Use your own judgment and continue."})
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+             "function": {"name": "clarify", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": payload + "x" * _PRUNE_MIN_CHARS},
+            {"role": "user", "content": "recent request"},
+            {"role": "assistant", "content": "recent response"},
+        ]
+        pruned, count = compressor._prune_old_tool_results(
+            messages, protect_tail_count=2, summary_input_budget=600_000,
+        )
+        assert count == 1
+        assert "using your own judgment" not in pruned[1]["content"]
 
 
 class TestShouldCompress:
@@ -1454,6 +1522,101 @@ class TestStreamingClosedFailure:
         """Real transport errors stay terminal (#29559/#94448), even when their text
         happens to contain the stall marker: only a TimeoutError stall is reclassified."""
         assert self._fail_on_main(err)._last_summary_network_failure is True
+
+
+class TestConfiguredCompressionFallbackChain:
+    """A capacity failure on the summariser (truncated, stalled, empty) belongs on the next
+    summariser the user configured, not on a replay of the same oversized prompt on the main model.
+    Measured on 2026-11-05: 30s on a flash-class summariser against 142s and 268s on the main model
+    for the identical compaction."""
+
+    def _msgs(self):
+        return [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+    def _ok(self, text):
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = text
+        return mock_ok
+
+    def _err(self):
+        err = Exception("404 model_not_found: no such model")
+        err.status_code = 404
+        return err
+
+    def _compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="main-model",
+                summary_model_override="broken-aux-model",
+                quiet_mode=True,
+            )
+
+    def test_configured_chain_is_tried_before_the_main_model(self):
+        c = self._compressor()
+        chain = [{"provider": "openrouter", "model": "backup-summariser"}]
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": chain}), patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._err(), self._ok("summary via configured chain")],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
+        assert mock_call.call_args_list[1].kwargs.get("model") == "backup-summariser"
+        assert result is not None and "summary via configured chain" in result
+        # Never treated as a main-model fallback: the chain absorbed it.
+        assert c._summary_model_fallen_back is False
+
+    def test_exhausted_chain_still_falls_back_to_the_main_model(self):
+        c = self._compressor()
+        chain = [{"provider": "openrouter", "model": "backup-summariser"}]
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": chain}), patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._err(), self._err(), self._ok("summary via main model")],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 3
+        assert [call.kwargs.get("model") for call in mock_call.call_args_list] == [
+            "broken-aux-model",
+            "backup-summariser",
+            "main-model",
+        ]
+        assert result is not None and "summary via main model" in result
+        # The main-model hop happened, and it names the model that actually failed last.
+        assert c._last_aux_model_failure_model == "backup-summariser"
+
+    def test_no_chain_keeps_the_old_single_hop_to_main(self):
+        c = self._compressor()
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={}), patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._err(), self._ok("summary via main model")],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
+        assert result is not None and "summary via main model" in result
+
+    def test_a_chain_entry_for_another_provider_is_skipped(self):
+        """The credential in hand belongs to the provider already in use; it must not be sent
+        to a different host on the strength of a config entry."""
+        c = self._compressor()
+        c.provider = "openrouter"
+        chain = [{"provider": "anthropic", "model": "claude-somewhere-else"}]
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": chain}), patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._err(), self._ok("summary via main model")],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
+        assert result is not None
 
 
 class TestAuxModelFallbackSurfacedToCallers:
@@ -3199,7 +3362,10 @@ class TestSummaryPromptBounding:
         one run joined by the record separator — no zero-width elision marker, no missing
         separator — and the coverage telemetry still counts each shown record once."""
         cap = ContextCompressor._SUMMARY_INPUT_MAX_CHARS
-        records = [f"[USER]: record-{i:02d} " + ("x" * 8500) for i in range(20)]
+        # Record size is derived from the cap, not hardcoded: one record ~= 1/20 of the cap keeps
+        # the slice geometry (8 slices, ~2.4 records each) identical whatever the cap becomes.
+        per_record = cap // 20 + 1000
+        records = [f"[USER]: record-{i:02d} " + ("x" * per_record) for i in range(20)]
         assert sum(map(len, records)) > cap  # sampling engages, with headroom > one gap
         sampled, coverage = ContextCompressor._sample_summary_records(records)
         assert len(sampled) <= cap

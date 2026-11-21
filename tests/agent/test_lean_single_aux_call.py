@@ -138,8 +138,10 @@ class TestSampledSummaryInput:
 
     def test_sampling_is_bounded_ordered_and_marked(self):
         # Distinct decade markers let us verify oldest-to-newest order and
-        # uniform coverage across the whole region.
-        records = [f"<seg{i:02d}>" + ("x" * 50_000) for i in range(10)]
+        # uniform coverage across the whole region. Record size follows the cap so the
+        # region overflows it whatever the cap is set to.
+        cap = ContextCompressor._SUMMARY_INPUT_MAX_CHARS
+        records = [f"<seg{i:02d}>" + ("x" * (cap // 10 + 10_000)) for i in range(10)]
         out, _coverage = ContextCompressor._sample_summary_records(records)
         assert len(out) <= ContextCompressor._SUMMARY_INPUT_MAX_CHARS
         assert "chars elided" in out
