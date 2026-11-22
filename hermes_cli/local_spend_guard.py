@@ -614,10 +614,25 @@ def spend_reading():
     delta = total - baseline["day_start_usage"]
     hour = datetime.now(RECOVERY_ZONE).hour
     utc_aligned = 4 <= hour < 20
-    spend = max(daily, delta) if utc_aligned else delta
+    # The account total is every key on the OpenRouter account. The attended desktop
+    # key is one of them, and its spend is not the unattended cap's business: counting
+    # it meant an hour of conversation could trip the cap on work that had not spent
+    # anything. Subtract the interactive key (same UTC-day caveat as above).
+    interactive_day = 0.0
+    if utc_aligned:
+        try:
+            from agent.interactive_spending import _interactive_key as _ikey
+            _ik = _ikey()
+            if _ik:
+                interactive_day = _key_daily(_ik)
+        except Exception:
+            interactive_day = 0.0
+    worker_delta = max(0.0, delta - interactive_day)
+    spend = max(daily, worker_delta) if utc_aligned else delta
     return {"spend": spend, "basis": "account",
             "degraded": False, "reason": "",
-            "detail": {"account_delta": delta, "key_daily": daily, "utc_aligned": utc_aligned}}
+            "detail": {"account_delta": delta, "key_daily": daily, "utc_aligned": utc_aligned,
+                       "interactive_key_daily": interactive_day, "worker_delta": worker_delta}}
 
 
 def live_spend():
@@ -702,7 +717,12 @@ def main():
                 total = _account_total()
                 print(f"  basis: account-wide usage since {baseline.get('date','?')} local midnight "
                       f"(baseline ${baseline.get('day_start_usage', 0):.4f}, account total ${total:.4f})")
-                print("  note: includes Honcho derivation/embeddings and any other profile using this key.")
+                d = reading.get("detail") or {}
+                if d.get("interactive_key_daily"):
+                    print(f"  attended chat on the interactive key, excluded: ${d['interactive_key_daily']:.2f}")
+                print("  note: Honcho bills its own provider with its own key (verified 2026-11-21) and is "
+                      "NOT in this figure; see spend.honcho_daily_cap_usd in limits.yaml. "
+                      "Run `python3 scripts/spend_sources.py` for the per-key split.")
             except Exception:
                 pass
             if reading["degraded"]:

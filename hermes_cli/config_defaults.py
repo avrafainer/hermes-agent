@@ -1844,6 +1844,12 @@ DEFAULT_CONFIG = {
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "auto_subscribe_on_create": True,
+        # Route every new card's terminal events to the DESKTOP app as well
+        # (platform="desktop", chat_id="*"): the desktop's chat sessions are the
+        # only poller that serves those rows (tui_gateway/session_notifications.py).
+        # Off by default — an install with no desktop client would otherwise
+        # accumulate a subscription row per card.
+        "notify_desktop": False,
         # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
         # not own notification subscriptions to avoid an idle five-second board probe.
         "notify_in_gateway": True,

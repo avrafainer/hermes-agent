@@ -64,6 +64,68 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     return {str(key): value for key, value in data.items() if isinstance(value, _SCALAR_TYPES)}
 
 
+# --- desktop channel -------------------------------------------------------
+# The desktop app is not a gateway platform: it has no messaging adapter and no
+# ``Platform`` enum member, so the gateway notifier skips its rows (they land in
+# its "adapter not connected" debug branch and keep their cursor). Its chat
+# sessions live inside the ``hermes serve`` (tui_gateway) process — the same
+# process whose per-session poller delivers ``platform="tui"`` rows — and that
+# poller is therefore the delivery path for this channel
+# (tui_gateway/session_notifications.py::_kb_poll_board).
+#
+# ``chat_id="*"`` addresses "whichever desktop session is live". The atomic
+# cursor claim (claim_unseen_events_for_sub) means only one live session can
+# ever claim an event, and a row left unclaimed by a session that was closed
+# when the card closed is still there for the next desktop session to read.
+DESKTOP_PLATFORM = "desktop"
+DESKTOP_ANY_CHAT = "*"
+
+
+def desktop_notify_enabled() -> bool:
+    """``kanban.notify_desktop`` (default False): route new cards' terminal
+    events to the desktop app. Off by default so an install that has no desktop
+    client does not accumulate a subscription row per card."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        section = load_config_readonly().get("kanban") or {}
+        return bool(section.get("notify_desktop", False)) if isinstance(section, dict) else False
+    except Exception:
+        return False
+
+
+def add_desktop_notify_sub(
+    conn: sqlite3.Connection, *, task_id: str, created_at: Optional[int] = None,
+    notifier_profile: Optional[str] = None,
+) -> bool:
+    """Give ``task_id`` the board's desktop route (``desktop:*``); idempotent,
+    and a no-op while :func:`desktop_notify_enabled` is false.
+
+    Called from ``kanban_db.create_task`` inside its write transaction, so this
+    must never open a transaction of its own (same rule as
+    ``_inherit_notify_subs``). New subs start caught up on the task's current
+    event, so creating a card never replays events it did not cause.
+    """
+    if not desktop_notify_enabled():
+        return False
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?", (task_id,),
+    ).fetchone()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, chat_type, notifier_profile,
+             delivery_mode, created_at, last_event_id)
+        VALUES (?, ?, ?, '', 'dm', ?, 'notify', ?, ?)
+        """,
+        (
+            task_id, DESKTOP_PLATFORM, DESKTOP_ANY_CHAT, notifier_profile,
+            int(created_at if created_at is not None else time.time()),
+            int(row["cursor"] if row is not None else 0),
+        ),
+    )
+    return True
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,

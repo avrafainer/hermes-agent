@@ -616,6 +616,11 @@ def check(task_id: str, action: str, *, profile: Optional[str] = None) -> tuple[
         if origin and derive_origin_grant(task_id, origin):
             g, why = resolve(task_id)
     if g is None:
+        # No origin session and no binding: a decomposed child. Its authority is the
+        # parent's, bound once here so the card stops being skipped in silence.
+        if _inherit_from_parent(task_id):
+            g, why = resolve(task_id)
+    if g is None:
         verdict, reason = "needs_approval", why
     elif action not in g["actions"]:
         verdict, reason = "needs_approval", f"grant {g['grant_id']} does not include {action}"
@@ -885,7 +890,45 @@ def derive_origin_grant(task_id: str, session_id: Optional[str]) -> Optional[dic
     return None
 
 
+def _inherit_from_parent(task_id: str) -> Optional[str]:
+    """Bind a card to a parent's grant when it carries none of its own.
+
+    A decomposed child is created by the decomposer, which runs as a worker: the card has
+    no interactive origin session, so origin derivation can never bind it and the
+    dispatcher skips it in silence -- for ever. What authorised that work is the parent, and
+    a child cannot be more authorised than the tree that produced it. The child points at
+    the parent's grant row rather than a copy, so spending stays on the one allowance.
+    """
+    path = pathlib.Path(os.environ.get("HERMES_KANBAN_DB") or (_home() / "kanban.db"))
+    if not path.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        parents = [r[0] for r in con.execute(
+            "select parent_id from task_links where child_id=?", (task_id,))]
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    for pid in parents:
+        g, _why = resolve(pid)
+        if g is None:
+            continue
+        try:
+            bind(task_id, g["grant_id"])
+        except Exception:  # a refused bind leaves the card unbound
+            return None
+        _log(task_id, "dispatch", "allow", f"inherited {g['grant_id']} from parent {pid}",
+             mode(), grant=g["grant_id"])
+        return g["grant_id"]
+    return None
+
+
 def _task_origin_session(task_id: str) -> Optional[str]:
+
     """The session a card was created in, read straight from the board.
 
     The board is read as a file rather than imported: this module stays independent of

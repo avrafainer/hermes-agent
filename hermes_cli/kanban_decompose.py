@@ -271,6 +271,42 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
     return children, ""
 
 
+def _title_key(title: str) -> str:
+    """Comparison key for duplicate detection: case, punctuation and spacing folded away."""
+    return re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+
+
+def _open_title_keys(conn, *, exclude: str = "") -> dict[str, str]:
+    """Map normalised title -> task id for every card that is still live on the board.
+
+    Decomposition had no dedupe, so a busy review loop could fan the same work out again and
+    again (2026-11-21: 19 duplicate cards in 25 minutes, five copies of one episode). Checking
+    the live board before creating children is what stops that.
+    """
+    rows = conn.execute(
+        "select id, title from tasks where status not in ('done', 'archived') and id != ?",
+        (exclude,),
+    ).fetchall()
+    return {_title_key(t): i for i, t in rows if t}
+
+
+def _drop_duplicate_children(task_id: str, children: list[dict], conn) -> tuple[list[dict], list[str]]:
+    """Remove children whose title already exists on the live board, or repeats within this batch."""
+    existing = _open_title_keys(conn, exclude=task_id)
+    kept: list[dict] = []
+    skipped: list[str] = []
+    for child in children:
+        key = _title_key(child["title"])
+        if not key:
+            continue
+        if key in existing:
+            skipped.append(f"{child['title']} (already {existing[key]})")
+            continue
+        existing[key] = task_id  # a second identical child in this same batch is also a duplicate
+        kept.append(child)
+    return kept, skipped
+
+
 def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
@@ -280,6 +316,12 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
         return DecomposeOutcome(task_id, False, reason)
     try:
         with kbc.connect_closing() as conn:
+            children, skipped = _drop_duplicate_children(task_id, children, conn)
+            if not children:
+                return DecomposeOutcome(
+                    task_id, False,
+                    "every child already exists on the board: " + "; ".join(skipped[:5]),
+                )
             child_ids = decompose_triage_task(
                 conn,
                 task_id,

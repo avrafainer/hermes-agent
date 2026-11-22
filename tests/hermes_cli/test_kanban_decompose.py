@@ -250,3 +250,71 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_decompose_skips_children_that_already_exist_on_the_board(kanban_home):
+    """A child whose work is already live must not be created again.
+
+    Regression: without this check a busy review loop re-decomposed the same work every few
+    minutes, so one episode of work existed as five separate cards (2026-11-21).
+    """
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="Research the widget")  # already live, different case/punctuation
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [
+            {"title": "research the widget!", "body": "duplicate", "assignee": "researcher", "parents": []},
+            {"title": "build the widget", "body": "new work", "assignee": "engineer", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 1
+    with kbc.connect() as conn:
+        titles = []
+        for cid in outcome.child_ids:
+            task = kb.get_task(conn, cid)
+            assert task is not None
+            titles.append(task.title)
+    assert titles == ["build the widget"]
+
+
+def test_decompose_fails_when_every_child_already_exists(kanban_home):
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="the only task")
+        tid = kb.create_task(conn, title="duplicate fanout", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [{"title": "The Only Task", "body": "", "assignee": "engineer", "parents": []}],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "already exists" in outcome.reason
+    with kbc.connect() as conn:
+        root = kb.get_task(conn, tid)
+        assert root is not None and root.status == "triage"
+
+

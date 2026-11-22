@@ -519,16 +519,41 @@ def _kb_reclaim_stray_subs(_kbn, slug: str, session_key: str, stray: tuple) -> b
         return False
 
 
-def _kb_poll_board(_kb, slug: str, session_key: str, stray: tuple = (), unreclaimed: list | None = None) -> list:
+def _kb_sub_owned_by(_kbn, sub: dict, session_key: str, desktop: bool, own_task_ids: set) -> bool:
+    """Does this subscription belong to THIS session?
+
+    ``tui`` rows are the session's own (chat_id is its key). ``desktop`` rows are
+    the board's desktop route: ``chat_id`` is either a session key (that one
+    desktop session) or ``"*"`` — the desktop app's "wherever I am" address,
+    which any live desktop-session poller may claim. A ``"*"`` row is skipped for
+    a task this session already owns a ``tui`` row for, so a card created in the
+    desktop chat is announced once, not twice.
+    """
+    platform = (sub.get("platform") or "").lower()
+    chat_id = sub.get("chat_id")
+    if platform == "tui":
+        return chat_id == session_key
+    if platform == _kbn.DESKTOP_PLATFORM and desktop:
+        if chat_id == session_key:
+            return True
+        return chat_id == _kbn.DESKTOP_ANY_CHAT and sub.get("task_id") not in own_task_ids
+    return False
+
+
+def _kb_poll_board(_kb, slug: str, session_key: str, stray: tuple = (), unreclaimed: list | None = None,
+                   *, desktop: bool = False) -> list:
     """Claim + format this session's unseen events on one board. One poller per live session: the board is not opened
     writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
-    falls through so delivery is preserved). A board whose stray-subscription reclaim failed lands in ``unreclaimed``."""
+    falls through so delivery is preserved). ``desktop`` marks a desktop-app session, which also serves the board's
+    ``platform="desktop"`` rows (see ``_kb_sub_owned_by``). A board whose stray-subscription reclaim failed lands in
+    ``unreclaimed``."""
     from hermes_cli import kanban_db_connect as _kbc
     from hermes_cli import kanban_db_notify as _kbn
     if stray and not _kb_reclaim_stray_subs(_kbn, slug, session_key, stray) and unreclaimed is not None:
         unreclaimed.append(slug)
     with contextlib.suppress(Exception):
-        if _kbn.count_notify_subs(board=slug, platform="tui", chat_id=session_key) == 0:
+        owns_any = _kbn.count_notify_subs(board=slug, platform="tui", chat_id=session_key) != 0
+        if not owns_any and not (desktop and _kbn.count_notify_subs(board=slug, platform=_kbn.DESKTOP_PLATFORM)):
             return []
     try:
         conn = _kbc.connect(board=slug)
@@ -540,8 +565,10 @@ def _kb_poll_board(_kb, slug: str, session_key: str, stray: tuple = (), unreclai
             subs = _kbn.list_notify_subs(conn)
         except Exception:
             return []
+        own_task_ids = {sub["task_id"] for sub in subs
+                        if (sub.get("platform") or "").lower() == "tui" and sub.get("chat_id") == session_key}
         for sub in subs:
-            if (sub.get("platform") or "").lower() != "tui" or sub.get("chat_id") != session_key:
+            if not _kb_sub_owned_by(_kbn, sub, session_key, desktop, own_task_ids):
                 continue
             sub_ident = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
                              thread_id=sub.get("thread_id") or "")
@@ -589,7 +616,9 @@ def _collect_kanban_notifications(session: dict) -> list:
     for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
         unique.setdefault(resolved, slug)
     stray, unreclaimed = _kb_stray_delegate_keys(session, session_key), []
-    texts = [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key, stray, unreclaimed)]
+    desktop = str(session.get("source") or "").lower() == "desktop"
+    texts = [t for slug in unique.values()
+             for t in _kb_poll_board(_kb, slug, session_key, stray, unreclaimed, desktop=desktop)]
     if stray and not unreclaimed:
         session["_kanban_stray_keys"] = ()  # every board is clean; stop probing
     return texts

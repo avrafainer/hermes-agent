@@ -1388,6 +1388,13 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                # The desktop app is a delivery surface without a gateway
+                # platform: give every card (including ones created by a cron
+                # or a worker, which have no originating chat to subscribe) the
+                # board's ``desktop:*`` route, so its closure reaches the
+                # desktop even if no chat session was live when it closed.
+                from hermes_cli.kanban_db_notify import add_desktop_notify_sub
+                add_desktop_notify_sub(conn, task_id=task_id, created_at=now)
                 # Execution authority is inherited, never invented. A child of an
                 # authorised card carries the parent's grant (and therefore its
                 # actions, expiry and single spending allowance); a child of an
@@ -3585,6 +3592,19 @@ def request_changes(
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
+        # Two rounds of the same objection and the reviewer is no longer reviewing, it is
+        # arguing. On 2026-11-21 six cards went through three to five rounds in minutes
+        # (t_e6417850 had five in seven minutes), each round costing a worker run and a
+        # review run. A disagreement a third round cannot settle needs a human, not a
+        # fourth round: park the card in triage with both positions written down.
+        MAX_CHANGES_ROUNDS = 2
+        prior_rounds = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
+            (task_id,),
+        ).fetchone()[0]
+        escalate = prior_rounds >= MAX_CHANGES_ROUNDS
+        if escalate:
+            new_status = "triage"
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
         cur = conn.execute(
@@ -3616,6 +3636,28 @@ def request_changes(
             },
             run_id=run_id,
         )
+        if escalate:
+            _append_event(
+                conn, task_id, "escalated_review_disagreement",
+                {"rounds": prior_rounds + 1, "reviewer": reviewer,
+                 "implementer": implementer, "reason": reason[:400]},
+                run_id=run_id,
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "Chief of Staff",
+                 f"## Escalated after {prior_rounds + 1} change requests\n\n"
+                 f"This card has come back from review {prior_rounds + 1} times. A further round "
+                 f"would spend another worker run and another review run on the same disagreement, "
+                 f"so it is parked in triage instead of being handed back.\n\n"
+                 f"**Reviewer's last objection:**\n\n> {reason[:1200]}\n\n"
+                 f"**What the implementer produced is on disk and unchanged.** The two positions "
+                 f"above are both in the card history; nothing was discarded or reverted.\n\n"
+                 f"**Decision needed:** either the acceptance bar in this card is wrong for the work, "
+                 f"or the work is wrong for the bar. Settle which and the card resumes with that "
+                 f"written into the body, so a third round cannot repeat the argument.",
+                 int(time.time())),
+            )
     return True, implementer
 
 
