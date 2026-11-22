@@ -1153,7 +1153,10 @@ export function useMessageStream({
           needsInput: false,
           interimBoundaryPending: false,
           turnStartedAt: null,
-          turnLive: false
+          turnLive: false,
+          // Reached with a latch set only for a completed-and-persisted turn
+          // (terminalCompletionState); that turn is settled now, so the latch goes.
+          interrupted: false
         }
       })
 
