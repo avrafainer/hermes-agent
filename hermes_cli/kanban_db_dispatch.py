@@ -3048,9 +3048,18 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """The profile owner executes; this subprocess only waits for its receipt."""
+    """The profile owner executes; this subprocess only waits for its receipt.
+
+    ``-P`` is load-bearing, not tidiness. This client is spawned with ``cwd=workspace``, and
+    ``python -m`` prepends the cwd to ``sys.path``: a workspace holding any stdlib-named file
+    (``inspect.py``, ``logging.py``, ``types.py``, ...) then shadows the real module and kills
+    the worker at import time, before it can even submit its claim. Six crashed runs on
+    t_765f57f4 died exactly that way — ``AttributeError: module 'inspect' has no attribute
+    'signature'`` from ``dataclasses`` inside ``hermes_bootstrap``. ``-P`` keeps the workspace
+    off ``sys.path``; the tree itself arrives explicitly through PYTHONPATH.
+    """
     import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    return [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
